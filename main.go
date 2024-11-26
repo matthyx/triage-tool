@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"os/exec"
@@ -9,7 +8,6 @@ import (
 	"strings"
 
 	mapset "github.com/deckarep/golang-set/v2"
-	"github.com/google/go-github/v66/github"
 )
 
 const (
@@ -94,23 +92,24 @@ func getIssues(repo string, limit int) ([]string, error) {
 	return urls, nil
 }
 
-func getPulls(ghClient *github.Client, owner, repo string) ([]*github.PullRequest, error) {
-	opts := &github.PullRequestListOptions{
-		State: "open",
-	}
-	var allPulls []*github.PullRequest
-	for {
-		pulls, resp, err := ghClient.PullRequests.List(context.Background(), owner, repo, opts)
-		if err != nil {
-			return nil, fmt.Errorf("failed to list pull requests: %w", err)
+func getPulls(repo string, limit int) ([]string, error) {
+	cmd := exec.Command("gh", "pr", "list", "-R", repo, "-L", strconv.Itoa(limit), "--json", "url")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		if strings.Contains(string(out), "repository has disabled issues") {
+			return nil, nil
 		}
-		allPulls = append(allPulls, pulls...)
-		if resp.NextPage == 0 {
-			break
-		}
-		opts.Page = resp.NextPage
+		return nil, fmt.Errorf("failed to list issues: %s", out)
 	}
-	return allPulls, nil
+	var issues IssueListOutput
+	if err := json.Unmarshal(out, &issues); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal repo: %w", err)
+	}
+	var urls []string
+	for _, issue := range issues {
+		urls = append(urls, issue.URL)
+	}
+	return urls, nil
 }
 
 func getRepositories(owner string, limit int) ([]string, error) {
@@ -137,30 +136,55 @@ func main() {
 		panic(err)
 	}
 	allIssues := mapset.NewSet[string]()
+	allPulls := mapset.NewSet[string]()
 	for _, repo := range repositories {
 		issues, err := getIssues(repo, limit)
 		if err != nil {
 			panic(err)
 		}
 		allIssues.Append(issues...)
+		pulls, err := getPulls(repo, limit)
+		if err != nil {
+			panic(err)
+		}
+		allPulls.Append(pulls...)
 	}
 	fmt.Println("issues", allIssues.Cardinality())
+	fmt.Println("pulls", allPulls.Cardinality())
 
-	trackedBugs, err := getProjectItems("kubescape", bugTrackingBoard, limit)
+	trackedIssues, err := getProjectItems("kubescape", bugTrackingBoard, limit)
 	if err != nil {
 		panic(err)
 	}
-	fmt.Println("tracked", trackedBugs.Cardinality())
+	fmt.Println("tracked issues", trackedIssues.Cardinality())
 
-	untrackedBugs := allIssues.Difference(trackedBugs)
-	fmt.Println("untracked", untrackedBugs.Cardinality())
+	trackedPulls, err := getProjectItems("kubescape", prTrackingBoard, limit)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("tracked pulls", trackedPulls.Cardinality())
 
-	untrackedBugs.Each(func(url string) bool {
+	untrackedIssues := allIssues.Difference(trackedIssues)
+	fmt.Println("untracked issues", untrackedIssues.Cardinality())
+
+	untrackedIssues.Each(func(url string) bool {
 		err := addProjectItem("kubescape", bugTrackingBoard, url)
 		if err != nil {
 			panic(err)
 		}
-		fmt.Println("added", url)
+		fmt.Println("added issue", url)
+		return false
+	})
+
+	untrackedPulls := allPulls.Difference(trackedPulls)
+	fmt.Println("untracked pulls", untrackedPulls.Cardinality())
+
+	untrackedPulls.Each(func(url string) bool {
+		err := addProjectItem("kubescape", prTrackingBoard, url)
+		if err != nil {
+			panic(err)
+		}
+		fmt.Println("added pr", url)
 		return false
 	})
 }
