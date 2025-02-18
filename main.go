@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 
 	mapset "github.com/deckarep/golang-set/v2"
+	"github.com/gammazero/workerpool"
 )
 
 const (
@@ -137,18 +139,23 @@ func main() {
 	}
 	allIssues := mapset.NewSet[string]()
 	allPulls := mapset.NewSet[string]()
+	wp := workerpool.New(runtime.GOMAXPROCS(0))
 	for _, repo := range repositories {
-		issues, err := getIssues(repo, limit)
-		if err != nil {
-			panic(err)
-		}
-		allIssues.Append(issues...)
-		pulls, err := getPulls(repo, limit)
-		if err != nil {
-			panic(err)
-		}
-		allPulls.Append(pulls...)
+		wp.Submit(func() {
+			fmt.Println("processing", repo)
+			issues, err := getIssues(repo, limit)
+			if err != nil {
+				panic(err)
+			}
+			allIssues.Append(issues...)
+			pulls, err := getPulls(repo, limit)
+			if err != nil {
+				panic(err)
+			}
+			allPulls.Append(pulls...)
+		})
 	}
+	wp.StopWait()
 	fmt.Println("issues", allIssues.Cardinality())
 	fmt.Println("pulls", allPulls.Cardinality())
 
