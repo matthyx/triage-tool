@@ -29,6 +29,7 @@ changelog:
       - "^test:"
 
 release:
+  draft: true
   footer: >-
 
     ---
