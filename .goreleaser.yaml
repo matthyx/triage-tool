@@ -21,6 +21,33 @@ builds:
       - amd64
       - arm64
 
+docker_manifests:
+  - name_template: "quay.io/matthiasb_1/triage-tool:{{ .Tag }}"
+    image_templates:
+      - "quay.io/matthiasb_1/triage-tool:{{ .Tag }}-amd64"
+      - "quay.io/matthiasb_1/triage-tool:{{ .Tag }}-arm64"
+
+dockers:
+  - image_templates:
+      - "quay.io/matthiasb_1/triage-tool:{{ .Tag }}-amd64"
+    use: buildx
+    build_flag_templates:
+      - "--pull"
+      - "--platform=linux/amd64"
+      - "--build-arg"
+      - "image_version={{ .Tag }}"
+    dockerfile: build/Dockerfile
+  - image_templates:
+      - "quay.io/matthiasb_1/triage-tool:{{ .Tag }}-arm64"
+    use: buildx
+    build_flag_templates:
+      - "--pull"
+      - "--platform=linux/arm64"
+      - "--build-arg"
+      - "image_version={{ .Tag }}"
+    goarch: arm64
+    dockerfile: build/Dockerfile
+
 changelog:
   sort: asc
   filters:
