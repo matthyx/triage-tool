@@ -174,17 +174,12 @@ func main() {
 	untrackedIssues := allIssues.Difference(trackedIssues)
 	fmt.Println("untracked issues", untrackedIssues.Cardinality())
 
-	// regenerate worker pool that has been closed
-	wp = workerpool.New(runtime.GOMAXPROCS(0))
-
 	untrackedIssues.Each(func(url string) bool {
-		wp.Submit(func() {
-			err := addProjectItem("kubescape", bugTrackingBoard, url)
-			if err != nil {
-				fmt.Println(err)
-			}
-			fmt.Println("added issue", url)
-		})
+		err := addProjectItem("kubescape", bugTrackingBoard, url)
+		if err != nil {
+			panic(err)
+		}
+		fmt.Println("added issue", url)
 		return false
 	})
 
@@ -192,16 +187,11 @@ func main() {
 	fmt.Println("untracked pulls", untrackedPulls.Cardinality())
 
 	untrackedPulls.Each(func(url string) bool {
-		wp.Submit(func() {
-			err := addProjectItem("kubescape", prTrackingBoard, url)
-			if err != nil {
-				fmt.Println(err)
-			}
-			fmt.Println("added pr", url)
-		})
+		err := addProjectItem("kubescape", prTrackingBoard, url)
+		if err != nil {
+			panic(err)
+		}
+		fmt.Println("added pr", url)
 		return false
 	})
-
-	// Wait for all tasks to complete
-	wp.StopWait()
 }
