@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 
 	mapset "github.com/deckarep/golang-set/v2"
 	"github.com/gammazero/workerpool"
@@ -139,20 +140,34 @@ func main() {
 	}
 	allIssues := mapset.NewSet[string]()
 	allPulls := mapset.NewSet[string]()
+	var mu sync.Mutex
 	wp := workerpool.New(runtime.GOMAXPROCS(0))
 	for _, repo := range repositories {
 		wp.Submit(func() {
 			fmt.Println("processing", repo)
-			issues, err := getIssues(repo, limit)
-			if err != nil {
-				panic(err)
+			var wg sync.WaitGroup
+			var issues, pulls []string
+			var errI, errP error
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				issues, errI = getIssues(repo, limit)
+			}()
+			go func() {
+				defer wg.Done()
+				pulls, errP = getPulls(repo, limit)
+			}()
+			wg.Wait()
+			if errI != nil {
+				panic(errI)
 			}
+			if errP != nil {
+				panic(errP)
+			}
+			mu.Lock()
 			allIssues.Append(issues...)
-			pulls, err := getPulls(repo, limit)
-			if err != nil {
-				panic(err)
-			}
 			allPulls.Append(pulls...)
+			mu.Unlock()
 		})
 	}
 	wp.StopWait()
@@ -175,11 +190,13 @@ func main() {
 	fmt.Println("untracked issues", untrackedIssues.Cardinality())
 
 	untrackedIssues.Each(func(url string) bool {
-		err := addProjectItem("kubescape", bugTrackingBoard, url)
-		if err != nil {
-			panic(err)
-		}
-		fmt.Println("added issue", url)
+		wp.Submit(func() {
+			err := addProjectItem("kubescape", bugTrackingBoard, url)
+			if err != nil {
+				panic(err)
+			}
+			fmt.Println("added issue", url)
+		})
 		return false
 	})
 
@@ -187,11 +204,14 @@ func main() {
 	fmt.Println("untracked pulls", untrackedPulls.Cardinality())
 
 	untrackedPulls.Each(func(url string) bool {
-		err := addProjectItem("kubescape", prTrackingBoard, url)
-		if err != nil {
-			panic(err)
-		}
-		fmt.Println("added pr", url)
+		wp.Submit(func() {
+			err := addProjectItem("kubescape", prTrackingBoard, url)
+			if err != nil {
+				panic(err)
+			}
+			fmt.Println("added pr", url)
+		})
 		return false
 	})
+	wp.StopWait()
 }
