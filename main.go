@@ -3,12 +3,14 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	mapset "github.com/deckarep/golang-set/v2"
 	"github.com/gammazero/workerpool"
@@ -25,8 +27,8 @@ const (
 type GHClient interface {
 	AddProjectItem(ctx context.Context, owner, board, url string) error
 	GetProjectItems(ctx context.Context, owner, board string, limit int) (mapset.Set[string], error)
-	GetIssues(ctx context.Context, repo string, limit int) ([]string, error)
-	GetPulls(ctx context.Context, repo string, limit int) ([]string, error)
+	GetBothProjectItems(ctx context.Context, owner, bugBoard, prBoard string, limit int) (mapset.Set[string], mapset.Set[string], error)
+	GetIssuesAndPulls(ctx context.Context, repo string, limit int) ([]string, []string, error)
 	GetRepositories(ctx context.Context, owner string, limit int) ([]string, error)
 }
 
@@ -38,22 +40,131 @@ func NewRealGHClient(token string) *RealGHClient {
 	src := oauth2.StaticTokenSource(
 		&oauth2.Token{AccessToken: token},
 	)
-	httpClient := oauth2.NewClient(context.Background(), src)
+	transport := &oauth2.Transport{
+		Source: src,
+		Base: &http.Transport{
+			MaxIdleConns:          200,
+			MaxIdleConnsPerHost:   100,
+			IdleConnTimeout:       30 * time.Second,
+			MaxConnsPerHost:       200,
+			ResponseHeaderTimeout: 60 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+		},
+	}
+	httpClient := &http.Client{
+		Transport: transport,
+		Timeout:   120 * time.Second,
+	}
 	return &RealGHClient{
 		v4Client: githubv4.NewClient(httpClient),
 	}
 }
 
+func (c *RealGHClient) AddProjectItemsBatch(ctx context.Context, owner, board string, urls []string) error {
+	var wg sync.WaitGroup
+	wp := workerpool.New(runtime.GOMAXPROCS(0))
+	errChan := make(chan error, len(urls))
+	
+	for _, url := range urls {
+		wg.Add(1)
+		url := url
+		wp.Submit(func() {
+			defer wg.Done()
+			err := c.AddProjectItem(ctx, owner, board, url)
+			if err != nil {
+				select {
+				case errChan <- err:
+				default:
+				}
+			}
+		})
+	}
+	wp.StopWait()
+	wg.Wait()
+	
+	select {
+	case err := <-errChan:
+		return err
+	default:
+		return nil
+	}
+}
+
 func (c *RealGHClient) AddProjectItem(ctx context.Context, owner, board, url string) error {
-	// ProjectV2 items are better added via GraphQL, but for simplicity we can still shell out or implement Mutation
-	// Given the goal of Option 1, I'll keep the shell-out for this specific one if it's complex,
-	// but I'll implement the others via GraphQL.
 	cmd := exec.CommandContext(ctx, "gh", "project", "item-add", board, "--owner", owner, "--url", url)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("failed to add project item: %s", out)
 	}
 	return nil
+}
+
+func (c *RealGHClient) GetBothProjectItems(ctx context.Context, owner, bugBoard, prBoard string, limit int) (mapset.Set[string], mapset.Set[string], error) {
+	var query struct {
+		Organization struct {
+			BugProject struct {
+				Items struct {
+					Nodes []struct {
+						Content struct {
+							Issue struct {
+								URL string
+							} `graphql:"... on Issue"`
+							PullRequest struct {
+								URL string
+							} `graphql:"... on PullRequest"`
+						}
+					}
+				} `graphql:"items(first: $limit)"`
+			} `graphql:"projectV2(number: $bugBoard)"`
+			PRProject struct {
+				Items struct {
+					Nodes []struct {
+						Content struct {
+							Issue struct {
+								URL string
+							} `graphql:"... on Issue"`
+							PullRequest struct {
+								URL string
+							} `graphql:"... on PullRequest"`
+						}
+					}
+				} `graphql:"items(first: $limit)"`
+			} `graphql:"projectV2(number: $prBoard)"`
+		} `graphql:"organization(login: $owner)"`
+	}
+
+	bugBoardNum, _ := strconv.Atoi(bugBoard)
+	prBoardNum, _ := strconv.Atoi(prBoard)
+	variables := map[string]interface{}{
+		"owner":    githubv4.String(owner),
+		"bugBoard": githubv4.Int(bugBoardNum),
+		"prBoard":  githubv4.Int(prBoardNum),
+		"limit":    githubv4.Int(limit),
+	}
+
+	err := c.v4Client.Query(ctx, &query, variables)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	bugURLs := mapset.NewSet[string]()
+	for _, item := range query.Organization.BugProject.Items.Nodes {
+		if url := item.Content.Issue.URL; url != "" {
+			bugURLs.Add(url)
+		} else if url := item.Content.PullRequest.URL; url != "" {
+			bugURLs.Add(url)
+		}
+	}
+
+	prURLs := mapset.NewSet[string]()
+	for _, item := range query.Organization.PRProject.Items.Nodes {
+		if url := item.Content.Issue.URL; url != "" {
+			prURLs.Add(url)
+		} else if url := item.Content.PullRequest.URL; url != "" {
+			prURLs.Add(url)
+		}
+	}
+	return bugURLs, prURLs, nil
 }
 
 func (c *RealGHClient) GetProjectItems(ctx context.Context, owner, board string, limit int) (mapset.Set[string], error) {
@@ -90,19 +201,19 @@ func (c *RealGHClient) GetProjectItems(ctx context.Context, owner, board string,
 
 	urls := mapset.NewSet[string]()
 	for _, item := range query.Organization.ProjectV2.Items.Nodes {
-		if item.Content.Issue.URL != "" {
-			urls.Add(item.Content.Issue.URL)
-		} else if item.Content.PullRequest.URL != "" {
-			urls.Add(item.Content.PullRequest.URL)
+		if url := item.Content.Issue.URL; url != "" {
+			urls.Add(url)
+		} else if url := item.Content.PullRequest.URL; url != "" {
+			urls.Add(url)
 		}
 	}
 	return urls, nil
 }
 
-func (c *RealGHClient) GetIssues(ctx context.Context, repo string, limit int) ([]string, error) {
-	parts := strings.Split(repo, "/")
-	if len(parts) != 2 {
-		return nil, fmt.Errorf("invalid repo format: %s", repo)
+func (c *RealGHClient) GetIssuesAndPulls(ctx context.Context, repo string, limit int) ([]string, []string, error) {
+	slashIdx := strings.IndexByte(repo, '/')
+	if slashIdx < 0 {
+		return nil, nil, fmt.Errorf("invalid repo format: %s", repo)
 	}
 
 	var query struct {
@@ -112,35 +223,6 @@ func (c *RealGHClient) GetIssues(ctx context.Context, repo string, limit int) ([
 					URL string
 				}
 			} `graphql:"issues(first: $limit, states: OPEN)"`
-		} `graphql:"repository(owner: $owner, name: $name)"`
-	}
-
-	variables := map[string]interface{}{
-		"owner": githubv4.String(parts[0]),
-		"name":  githubv4.String(parts[1]),
-		"limit": githubv4.Int(limit),
-	}
-
-	err := c.v4Client.Query(ctx, &query, variables)
-	if err != nil {
-		return nil, err
-	}
-
-	var urls []string
-	for _, issue := range query.Repository.Issues.Nodes {
-		urls = append(urls, issue.URL)
-	}
-	return urls, nil
-}
-
-func (c *RealGHClient) GetPulls(ctx context.Context, repo string, limit int) ([]string, error) {
-	parts := strings.Split(repo, "/")
-	if len(parts) != 2 {
-		return nil, fmt.Errorf("invalid repo format: %s", repo)
-	}
-
-	var query struct {
-		Repository struct {
 			PullRequests struct {
 				Nodes []struct {
 					URL string
@@ -150,21 +232,36 @@ func (c *RealGHClient) GetPulls(ctx context.Context, repo string, limit int) ([]
 	}
 
 	variables := map[string]interface{}{
-		"owner": githubv4.String(parts[0]),
-		"name":  githubv4.String(parts[1]),
+		"owner": githubv4.String(repo[:slashIdx]),
+		"name":  githubv4.String(repo[slashIdx+1:]),
 		"limit": githubv4.Int(limit),
 	}
 
 	err := c.v4Client.Query(ctx, &query, variables)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	var urls []string
-	for _, pr := range query.Repository.PullRequests.Nodes {
-		urls = append(urls, pr.URL)
+	issues := make([]string, len(query.Repository.Issues.Nodes))
+	for i, issue := range query.Repository.Issues.Nodes {
+		issues[i] = issue.URL
 	}
-	return urls, nil
+
+	pulls := make([]string, len(query.Repository.PullRequests.Nodes))
+	for i, pr := range query.Repository.PullRequests.Nodes {
+		pulls[i] = pr.URL
+	}
+	return issues, pulls, nil
+}
+
+func (c *RealGHClient) GetIssues(ctx context.Context, repo string, limit int) ([]string, error) {
+	issues, _, err := c.GetIssuesAndPulls(ctx, repo, limit)
+	return issues, err
+}
+
+func (c *RealGHClient) GetPulls(ctx context.Context, repo string, limit int) ([]string, error) {
+	_, pulls, err := c.GetIssuesAndPulls(ctx, repo, limit)
+	return pulls, err
 }
 
 func (c *RealGHClient) GetRepositories(ctx context.Context, owner string, limit int) ([]string, error) {
@@ -207,86 +304,131 @@ func main() {
 }
 
 func Run(ctx context.Context, client GHClient) {
+	start := time.Now()
+	defer func() {
+		fmt.Printf("Total time: %v\n", time.Since(start))
+	}()
+	
 	limit := 100
 	repositories, err := client.GetRepositories(ctx, "kubescape", limit)
 	if err != nil {
 		panic(err)
 	}
-	allIssues := mapset.NewSet[string]()
-	allPulls := mapset.NewSet[string]()
-	var mu sync.Mutex
-	wp := workerpool.New(runtime.GOMAXPROCS(0))
+	
+	issueChan := make(chan []string, max(runtime.GOMAXPROCS(0), len(repositories)))
+	pullChan := make(chan []string, max(runtime.GOMAXPROCS(0), len(repositories)))
+	wp := workerpool.New(runtime.GOMAXPROCS(0) * 4)
+	
 	for _, repo := range repositories {
+		repo := repo
 		wp.Submit(func() {
-			fmt.Println("processing", repo)
-			var wg sync.WaitGroup
-			var issues, pulls []string
-			var errI, errP error
-			wg.Add(2)
-			go func() {
-				defer wg.Done()
-				issues, errI = client.GetIssues(ctx, repo, limit)
-			}()
-			go func() {
-				defer wg.Done()
-				pulls, errP = client.GetPulls(ctx, repo, limit)
-			}()
-			wg.Wait()
-			if errI != nil {
-				panic(errI)
+			issues, pulls, err := client.GetIssuesAndPulls(ctx, repo, limit)
+			if err != nil {
+				fmt.Println("error processing repo:", repo, err)
+				return
 			}
-			if errP != nil {
-				panic(errP)
+			if len(issues) > 0 {
+				issueChan <- issues
 			}
-			mu.Lock()
-			allIssues.Append(issues...)
-			allPulls.Append(pulls...)
-			mu.Unlock()
+			if len(pulls) > 0 {
+				pullChan <- pulls
+			}
 		})
 	}
 	wp.StopWait()
+	close(issueChan)
+	close(pullChan)
+	
+	allIssues := mapset.NewSet[string]()
+	allPulls := mapset.NewSet[string]()
+	
+	for issues := range issueChan {
+		allIssues.Append(issues...)
+	}
+	for pulls := range pullChan {
+		allPulls.Append(pulls...)
+	}
+
 	fmt.Println("issues", allIssues.Cardinality())
 	fmt.Println("pulls", allPulls.Cardinality())
 
-	trackedIssues, err := client.GetProjectItems(ctx, "kubescape", bugTrackingBoard, limit)
-	if err != nil {
-		panic(err)
+	var trackedIssues, trackedPulls mapset.Set[string]
+	var errI, errP error
+	var wg sync.WaitGroup
+	wg.Add(2)
+	
+	go func() {
+		defer wg.Done()
+		trackedIssues, errI = client.GetProjectItems(ctx, "kubescape", bugTrackingBoard, limit)
+	}()
+	
+	go func() {
+		defer wg.Done()
+		trackedPulls, errP = client.GetProjectItems(ctx, "kubescape", prTrackingBoard, limit)
+	}()
+	
+	wg.Wait()
+	
+	if errI != nil {
+		panic(errI)
 	}
+	if errP != nil {
+		panic(errP)
+	}
+	
 	fmt.Println("tracked issues", trackedIssues.Cardinality())
-
-	trackedPulls, err := client.GetProjectItems(ctx, "kubescape", prTrackingBoard, limit)
-	if err != nil {
-		panic(err)
-	}
 	fmt.Println("tracked pulls", trackedPulls.Cardinality())
 
 	untrackedIssues := allIssues.Difference(trackedIssues)
-	fmt.Println("untracked issues", untrackedIssues.Cardinality())
-
-	wp = workerpool.New(runtime.GOMAXPROCS(0))
-	untrackedIssues.Each(func(url string) bool {
-		wp.Submit(func() {
-			err := client.AddProjectItem(ctx, "kubescape", bugTrackingBoard, url)
-			if err != nil {
-				panic(err)
-			}
-			fmt.Println("added issue", url)
-		})
-		return false
-	})
-
 	untrackedPulls := allPulls.Difference(trackedPulls)
+	fmt.Println("untracked issues", untrackedIssues.Cardinality())
 	fmt.Println("untracked pulls", untrackedPulls.Cardinality())
 
-	untrackedPulls.Each(func(url string) bool {
-		wp.Submit(func() {
-			err := client.AddProjectItem(ctx, "kubescape", prTrackingBoard, url)
-			if err != nil {
-				panic(err)
-			}
-			fmt.Println("added pr", url)
-		})
+	issueURLs := make([]string, 0, untrackedIssues.Cardinality())
+	untrackedIssues.Each(func(url string) bool {
+		issueURLs = append(issueURLs, url)
 		return false
 	})
-	wp.StopWait()
+	
+	prURLs := make([]string, 0, untrackedPulls.Cardinality())
+	untrackedPulls.Each(func(url string) bool {
+		prURLs = append(prURLs, url)
+		return false
+	})
+	
+	wg.Add(2)
+	
+	go func() {
+		defer wg.Done()
+		wp := workerpool.New(runtime.GOMAXPROCS(0) * 4)
+		for _, url := range issueURLs {
+			wp.Submit(func() {
+				err := client.AddProjectItem(ctx, "kubescape", bugTrackingBoard, url)
+				if err != nil {
+					fmt.Println("error adding issue", url)
+				} else {
+					fmt.Println("added issue", url)
+				}
+			})
+		}
+		wp.StopWait()
+	}()
+	
+	go func() {
+		defer wg.Done()
+		wp := workerpool.New(runtime.GOMAXPROCS(0) * 4)
+		for _, url := range prURLs {
+			wp.Submit(func() {
+				err := client.AddProjectItem(ctx, "kubescape", prTrackingBoard, url)
+				if err != nil {
+					fmt.Println("error adding pr", url)
+				} else {
+					fmt.Println("added pr", url)
+				}
+			})
+		}
+		wp.StopWait()
+	}()
+	
+	wg.Wait()
 }
