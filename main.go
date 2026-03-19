@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"runtime"
 	"strconv"
@@ -84,37 +85,63 @@ func (c *RealGHClient) GetProjectID(ctx context.Context, owner, board string) (s
 	return query.Organization.ProjectV2.ID, nil
 }
 
-func (c *RealGHClient) GetContentID(ctx context.Context, url string) (string, error) {
-	var query struct {
-		Resource struct {
-			ID string
-		} `graphql:"resource(url: $url)"`
-	}
-
-	variables := map[string]interface{}{
-		"url": githubv4.String(url),
-	}
-
-	err := c.v4Client.Query(ctx, &query, variables)
+func (c *RealGHClient) GetContentID(ctx context.Context, urlStr string) (string, error) {
+	parsedURL, err := url.Parse(urlStr)
 	if err != nil {
 		return "", err
 	}
-	return query.Resource.ID, nil
+
+	parts := strings.Split(parsedURL.Path, "/")
+	if len(parts) < 5 {
+		return "", fmt.Errorf("invalid GitHub URL format")
+	}
+
+	owner := parts[1]
+	repo := parts[2]
+	pullNum := parts[4]
+
+	var query struct {
+		Repository struct {
+			PullRequest struct {
+				ID string
+			} `graphql:"pullRequest(number: $number)"`
+		} `graphql:"repository(owner: $owner, name: $repo)"`
+	}
+
+	variables := map[string]interface{}{
+		"owner":  githubv4.String(owner),
+		"repo":   githubv4.String(repo),
+		"number": githubv4.Int(parsePullNumber(pullNum)),
+	}
+
+	err = c.v4Client.Query(ctx, &query, variables)
+	if err != nil {
+		return "", err
+	}
+	return query.Repository.PullRequest.ID, nil
+}
+
+func parsePullNumber(s string) int {
+	n, _ := strconv.Atoi(s)
+	return n
 }
 
 func (c *RealGHClient) AddProjectItemWithIDs(ctx context.Context, projectID, contentID string) error {
 	var mutation struct {
 		AddProjectV2ItemById struct {
 			ClientMutationID string
+			Item             struct {
+				ID string
+			}
 		} `graphql:"addProjectV2ItemById(input: $input)"`
 	}
 
-	type addProjectV2ItemByIdInput struct {
-		ProjectID githubv4.ID `json:"projectId"`
-		ContentID githubv4.ID `json:"contentId"`
+	type AddProjectV2ItemByIdInput struct {
+		ProjectID githubv4.ID `json:"projectId" graphql:"projectId"`
+		ContentID githubv4.ID `json:"contentId" graphql:"contentId"`
 	}
 
-	input := addProjectV2ItemByIdInput{
+	input := AddProjectV2ItemByIdInput{
 		ProjectID: githubv4.ID(projectID),
 		ContentID: githubv4.ID(contentID),
 	}
