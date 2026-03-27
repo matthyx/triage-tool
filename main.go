@@ -146,7 +146,21 @@ func (c *RealGHClient) AddProjectItemWithIDs(ctx context.Context, projectID, con
 		ContentID: githubv4.ID(contentID),
 	}
 
-	return c.v4Client.Mutate(ctx, &mutation, input, nil)
+	const maxRetries = 5
+	backoff := 500 * time.Millisecond
+	for i := range maxRetries {
+		err := c.v4Client.Mutate(ctx, &mutation, input, nil)
+		if err == nil {
+			return nil
+		}
+		if i < maxRetries-1 && strings.Contains(err.Error(), "temporary conflict") {
+			time.Sleep(backoff)
+			backoff *= 2
+			continue
+		}
+		return err
+	}
+	return nil
 }
 
 func (c *RealGHClient) AddProjectItem(ctx context.Context, owner, board, url string) error {
@@ -460,14 +474,39 @@ func Run(ctx context.Context, client GHClient) {
 		return false
 	})
 
+	var bugProjectID, prProjectID string
+	var errBug, errPR error
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		bugProjectID, errBug = client.GetProjectID(ctx, "kubescape", bugTrackingBoard)
+	}()
+	go func() {
+		defer wg.Done()
+		prProjectID, errPR = client.GetProjectID(ctx, "kubescape", prTrackingBoard)
+	}()
+	wg.Wait()
+	if errBug != nil {
+		panic(errBug)
+	}
+	if errPR != nil {
+		panic(errPR)
+	}
+
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
 		wp := workerpool.New(runtime.GOMAXPROCS(0) * 4)
 		for _, url := range issueURLs {
+			url := url
 			wp.Submit(func() {
-				err := client.AddProjectItem(ctx, "kubescape", bugTrackingBoard, url)
+				contentID, err := client.GetContentID(ctx, url)
+				if err != nil {
+					fmt.Println("error adding issue", url, err)
+					return
+				}
+				err = client.AddProjectItemWithIDs(ctx, bugProjectID, contentID)
 				if err != nil {
 					fmt.Println("error adding issue", url, err)
 				} else {
@@ -482,8 +521,14 @@ func Run(ctx context.Context, client GHClient) {
 		defer wg.Done()
 		wp := workerpool.New(runtime.GOMAXPROCS(0) * 4)
 		for _, url := range prURLs {
+			url := url
 			wp.Submit(func() {
-				err := client.AddProjectItem(ctx, "kubescape", prTrackingBoard, url)
+				contentID, err := client.GetContentID(ctx, url)
+				if err != nil {
+					fmt.Println("error adding pr", url, err)
+					return
+				}
+				err = client.AddProjectItemWithIDs(ctx, prProjectID, contentID)
 				if err != nil {
 					fmt.Println("error adding pr", url, err)
 				} else {
