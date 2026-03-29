@@ -98,7 +98,28 @@ func (c *RealGHClient) GetContentID(ctx context.Context, urlStr string) (string,
 
 	owner := parts[1]
 	repo := parts[2]
-	pullNum := parts[4]
+	itemType := parts[3] // "issues" or "pull"
+	number := parts[4]
+
+	if itemType == "issues" {
+		var query struct {
+			Repository struct {
+				Issue struct {
+					ID string
+				} `graphql:"issue(number: $number)"`
+			} `graphql:"repository(owner: $owner, name: $repo)"`
+		}
+		variables := map[string]interface{}{
+			"owner":  githubv4.String(owner),
+			"repo":   githubv4.String(repo),
+			"number": githubv4.Int(parsePullNumber(number)),
+		}
+		err = c.v4Client.Query(ctx, &query, variables)
+		if err != nil {
+			return "", err
+		}
+		return query.Repository.Issue.ID, nil
+	}
 
 	var query struct {
 		Repository struct {
@@ -111,7 +132,7 @@ func (c *RealGHClient) GetContentID(ctx context.Context, urlStr string) (string,
 	variables := map[string]interface{}{
 		"owner":  githubv4.String(owner),
 		"repo":   githubv4.String(repo),
-		"number": githubv4.Int(parsePullNumber(pullNum)),
+		"number": githubv4.Int(parsePullNumber(number)),
 	}
 
 	err = c.v4Client.Query(ctx, &query, variables)
