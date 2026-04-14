@@ -378,18 +378,26 @@ func (c *RealGHClient) GetProjectItemsWithState(ctx context.Context, owner, boar
 		}
 
 		for _, node := range query.Organization.ProjectV2.Items.Nodes {
-			var url string
-			var closed bool
-			if node.Content.Issue.URL != "" {
-				url = node.Content.Issue.URL
-				closed = node.Content.Issue.State == "CLOSED"
-			} else if node.Content.PullRequest.URL != "" {
+			// githubv4 merges overlapping inline fragment fields, so Issue and
+			// PullRequest structs both receive the same URL and state values.
+			// Use Issue fields (always populated) and check both CLOSED and MERGED
+			// so that merged PRs are correctly treated as closed.
+			url := node.Content.Issue.URL
+			if url == "" {
 				url = node.Content.PullRequest.URL
-				closed = node.Content.PullRequest.State == "CLOSED" || node.Content.PullRequest.State == "MERGED"
-			} else {
+			}
+			if url == "" {
 				continue
 			}
-			items = append(items, ProjectItem{ID: node.ID, URL: url, Closed: closed})
+			state := node.Content.Issue.State
+			if state == "" {
+				state = node.Content.PullRequest.State
+			}
+			items = append(items, ProjectItem{
+				ID:     node.ID,
+				URL:    url,
+				Closed: state == "CLOSED" || state == "MERGED",
+			})
 		}
 
 		if !query.Organization.ProjectV2.Items.PageInfo.HasNextPage {
@@ -764,9 +772,9 @@ func Run(ctx context.Context, client GHClient) {
 			wp.Submit(func() {
 				err := client.UpdateProjectItemField(ctx, bugProjectID, item.ID, bugFieldID, bugOptionID)
 				if err != nil {
-					fmt.Println("error archiving issue", item.URL, err)
+					fmt.Println("error moving issue to archive", item.URL, err)
 				} else {
-					fmt.Println("archived issue", item.URL)
+					fmt.Println("moved issue to archive", item.URL)
 				}
 			})
 		}
@@ -784,9 +792,9 @@ func Run(ctx context.Context, client GHClient) {
 			wp.Submit(func() {
 				err := client.UpdateProjectItemField(ctx, prProjectID, item.ID, prFieldID, prOptionID)
 				if err != nil {
-					fmt.Println("error archiving pr", item.URL, err)
+					fmt.Println("error moving pr to archive", item.URL, err)
 				} else {
-					fmt.Println("archived pr", item.URL)
+					fmt.Println("moved pr to archive", item.URL)
 				}
 			})
 		}
