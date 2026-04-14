@@ -267,45 +267,61 @@ func (c *RealGHClient) GetBothProjectItems(ctx context.Context, owner, bugBoard,
 }
 
 func (c *RealGHClient) GetProjectItems(ctx context.Context, owner, board string, limit int) (mapset.Set[string], error) {
-	var query struct {
-		Organization struct {
-			ProjectV2 struct {
-				Items struct {
-					Nodes []struct {
-						Content struct {
-							Issue struct {
-								URL string
-							} `graphql:"... on Issue"`
-							PullRequest struct {
-								URL string
-							} `graphql:"... on PullRequest"`
-						}
-					}
-				} `graphql:"items(first: $limit)"`
-			} `graphql:"projectV2(number: $board)"`
-		} `graphql:"organization(login: $owner)"`
-	}
-
-	boardNum, _ := strconv.Atoi(board)
-	variables := map[string]interface{}{
-		"owner": githubv4.String(owner),
-		"board": githubv4.Int(boardNum),
-		"limit": githubv4.Int(limit),
-	}
-
-	err := c.v4Client.Query(ctx, &query, variables)
-	if err != nil {
-		return nil, err
-	}
-
 	urls := mapset.NewSet[string]()
-	for _, item := range query.Organization.ProjectV2.Items.Nodes {
-		if url := item.Content.Issue.URL; url != "" {
-			urls.Add(url)
-		} else if url := item.Content.PullRequest.URL; url != "" {
-			urls.Add(url)
+	var cursor *githubv4.String
+
+	for {
+		var query struct {
+			Organization struct {
+				ProjectV2 struct {
+					Items struct {
+						Nodes []struct {
+							Content struct {
+								Issue struct {
+									URL string
+								} `graphql:"... on Issue"`
+								PullRequest struct {
+									URL string
+								} `graphql:"... on PullRequest"`
+							}
+						}
+						PageInfo struct {
+							HasNextPage bool
+							EndCursor   githubv4.String
+						}
+					} `graphql:"items(first: $limit, after: $cursor)"`
+				} `graphql:"projectV2(number: $board)"`
+			} `graphql:"organization(login: $owner)"`
 		}
+
+		boardNum, _ := strconv.Atoi(board)
+		variables := map[string]interface{}{
+			"owner":  githubv4.String(owner),
+			"board":  githubv4.Int(boardNum),
+			"limit":  githubv4.Int(limit),
+			"cursor": cursor,
+		}
+
+		err := c.v4Client.Query(ctx, &query, variables)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, item := range query.Organization.ProjectV2.Items.Nodes {
+			if url := item.Content.Issue.URL; url != "" {
+				urls.Add(url)
+			} else if url := item.Content.PullRequest.URL; url != "" {
+				urls.Add(url)
+			}
+		}
+
+		if !query.Organization.ProjectV2.Items.PageInfo.HasNextPage {
+			break
+		}
+		endCursor := query.Organization.ProjectV2.Items.PageInfo.EndCursor
+		cursor = &endCursor
 	}
+
 	return urls, nil
 }
 
