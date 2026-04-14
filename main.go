@@ -38,9 +38,10 @@ type GHClient interface {
 }
 
 type ProjectItem struct {
-	ID     string
-	URL    string
-	Closed bool
+	ID        string
+	URL       string
+	Closed    bool
+	InArchive bool
 }
 
 type RealGHClient struct {
@@ -354,6 +355,13 @@ func (c *RealGHClient) GetProjectItemsWithState(ctx context.Context, owner, boar
 									State string
 								} `graphql:"... on PullRequest"`
 							}
+							FieldValues struct {
+								Nodes []struct {
+									SingleSelectValue struct {
+										Name string
+									} `graphql:"... on ProjectV2ItemFieldSingleSelectValue"`
+								}
+							} `graphql:"fieldValues(first: 10)"`
 						}
 						PageInfo struct {
 							HasNextPage bool
@@ -393,10 +401,18 @@ func (c *RealGHClient) GetProjectItemsWithState(ctx context.Context, owner, boar
 			if state == "" {
 				state = node.Content.PullRequest.State
 			}
+			inArchive := false
+			for _, fv := range node.FieldValues.Nodes {
+				if fv.SingleSelectValue.Name == "To Archive" {
+					inArchive = true
+					break
+				}
+			}
 			items = append(items, ProjectItem{
-				ID:     node.ID,
-				URL:    url,
-				Closed: state == "CLOSED" || state == "MERGED",
+				ID:        node.ID,
+				URL:       url,
+				Closed:    state == "CLOSED" || state == "MERGED",
+				InArchive: inArchive,
 			})
 		}
 
@@ -766,7 +782,7 @@ func Run(ctx context.Context, client GHClient) {
 		wp := workerpool.New(runtime.GOMAXPROCS(0) * 4)
 		for _, item := range bugItems {
 			item := item
-			if !item.Closed {
+			if !item.Closed || item.InArchive {
 				continue
 			}
 			wp.Submit(func() {
@@ -786,7 +802,7 @@ func Run(ctx context.Context, client GHClient) {
 		wp := workerpool.New(runtime.GOMAXPROCS(0) * 4)
 		for _, item := range prItems {
 			item := item
-			if !item.Closed {
+			if !item.Closed || item.InArchive {
 				continue
 			}
 			wp.Submit(func() {
