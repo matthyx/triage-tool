@@ -29,10 +29,18 @@ type GHClient interface {
 	GetProjectID(ctx context.Context, owner, board string) (string, error)
 	GetContentID(ctx context.Context, url string) (string, error)
 	AddProjectItemWithIDs(ctx context.Context, projectID, contentID string) error
-	GetProjectItems(ctx context.Context, owner, board string, limit int) (mapset.Set[string], error)
+	GetProjectItemsWithState(ctx context.Context, owner, board string, limit int) ([]ProjectItem, error)
 	GetBothProjectItems(ctx context.Context, owner, bugBoard, prBoard string, limit int) (mapset.Set[string], mapset.Set[string], error)
 	GetIssuesAndPulls(ctx context.Context, repo string, limit int) ([]string, []string, error)
 	GetRepositories(ctx context.Context, owner string, limit int) ([]string, error)
+	GetToArchiveFieldOption(ctx context.Context, owner, board string) (fieldID, optionID string, err error)
+	UpdateProjectItemField(ctx context.Context, projectID, itemID, fieldID, optionID string) error
+}
+
+type ProjectItem struct {
+	ID     string
+	URL    string
+	Closed bool
 }
 
 type RealGHClient struct {
@@ -325,6 +333,143 @@ func (c *RealGHClient) GetProjectItems(ctx context.Context, owner, board string,
 	return urls, nil
 }
 
+func (c *RealGHClient) GetProjectItemsWithState(ctx context.Context, owner, board string, limit int) ([]ProjectItem, error) {
+	var items []ProjectItem
+	var cursor *githubv4.String
+
+	for {
+		var query struct {
+			Organization struct {
+				ProjectV2 struct {
+					Items struct {
+						Nodes []struct {
+							ID      string
+							Content struct {
+								Issue struct {
+									URL   string
+									State string
+								} `graphql:"... on Issue"`
+								PullRequest struct {
+									URL   string
+									State string
+								} `graphql:"... on PullRequest"`
+							}
+						}
+						PageInfo struct {
+							HasNextPage bool
+							EndCursor   githubv4.String
+						}
+					} `graphql:"items(first: $limit, after: $cursor)"`
+				} `graphql:"projectV2(number: $board)"`
+			} `graphql:"organization(login: $owner)"`
+		}
+
+		boardNum, _ := strconv.Atoi(board)
+		variables := map[string]interface{}{
+			"owner":  githubv4.String(owner),
+			"board":  githubv4.Int(boardNum),
+			"limit":  githubv4.Int(limit),
+			"cursor": cursor,
+		}
+
+		err := c.v4Client.Query(ctx, &query, variables)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, node := range query.Organization.ProjectV2.Items.Nodes {
+			var url string
+			var closed bool
+			if node.Content.Issue.URL != "" {
+				url = node.Content.Issue.URL
+				closed = node.Content.Issue.State == "CLOSED"
+			} else if node.Content.PullRequest.URL != "" {
+				url = node.Content.PullRequest.URL
+				closed = node.Content.PullRequest.State == "CLOSED" || node.Content.PullRequest.State == "MERGED"
+			} else {
+				continue
+			}
+			items = append(items, ProjectItem{ID: node.ID, URL: url, Closed: closed})
+		}
+
+		if !query.Organization.ProjectV2.Items.PageInfo.HasNextPage {
+			break
+		}
+		endCursor := query.Organization.ProjectV2.Items.PageInfo.EndCursor
+		cursor = &endCursor
+	}
+
+	return items, nil
+}
+
+func (c *RealGHClient) GetToArchiveFieldOption(ctx context.Context, owner, board string) (string, string, error) {
+	var query struct {
+		Organization struct {
+			ProjectV2 struct {
+				Fields struct {
+					Nodes []struct {
+						SingleSelectField struct {
+							ID      string
+							Name    string
+							Options []struct {
+								ID   string
+								Name string
+							}
+						} `graphql:"... on ProjectV2SingleSelectField"`
+					}
+				} `graphql:"fields(first: 20)"`
+			} `graphql:"projectV2(number: $board)"`
+		} `graphql:"organization(login: $owner)"`
+	}
+
+	boardNum, _ := strconv.Atoi(board)
+	variables := map[string]interface{}{
+		"owner": githubv4.String(owner),
+		"board": githubv4.Int(boardNum),
+	}
+
+	err := c.v4Client.Query(ctx, &query, variables)
+	if err != nil {
+		return "", "", err
+	}
+
+	for _, node := range query.Organization.ProjectV2.Fields.Nodes {
+		for _, opt := range node.SingleSelectField.Options {
+			if opt.Name == "To Archive" {
+				return node.SingleSelectField.ID, opt.ID, nil
+			}
+		}
+	}
+	return "", "", fmt.Errorf("'To Archive' option not found in project board %s", board)
+}
+
+func (c *RealGHClient) UpdateProjectItemField(ctx context.Context, projectID, itemID, fieldID, optionID string) error {
+	var mutation struct {
+		UpdateProjectV2ItemFieldValue struct {
+			ClientMutationID string
+		} `graphql:"updateProjectV2ItemFieldValue(input: $input)"`
+	}
+
+	type ProjectV2FieldValueInput struct {
+		SingleSelectOptionID string `json:"singleSelectOptionId"`
+	}
+	type UpdateProjectV2ItemFieldValueInput struct {
+		ProjectID githubv4.ID              `json:"projectId"`
+		ItemID    githubv4.ID              `json:"itemId"`
+		FieldID   githubv4.ID              `json:"fieldId"`
+		Value     ProjectV2FieldValueInput `json:"value"`
+	}
+
+	input := UpdateProjectV2ItemFieldValueInput{
+		ProjectID: githubv4.ID(projectID),
+		ItemID:    githubv4.ID(itemID),
+		FieldID:   githubv4.ID(fieldID),
+		Value:     ProjectV2FieldValueInput{SingleSelectOptionID: optionID},
+	}
+
+	return c.v4Client.Mutate(ctx, &mutation, input, nil)
+}
+
 func (c *RealGHClient) GetIssuesAndPulls(ctx context.Context, repo string, limit int) ([]string, []string, error) {
 	slashIdx := strings.IndexByte(repo, '/')
 	if slashIdx < 0 {
@@ -467,19 +612,19 @@ func Run(ctx context.Context, client GHClient) {
 	fmt.Println("issues", allIssues.Cardinality())
 	fmt.Println("pulls", allPulls.Cardinality())
 
-	var trackedIssues, trackedPulls mapset.Set[string]
+	var bugItems, prItems []ProjectItem
 	var errI, errP error
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
-		trackedIssues, errI = client.GetProjectItems(ctx, "kubescape", bugTrackingBoard, limit)
+		bugItems, errI = client.GetProjectItemsWithState(ctx, "kubescape", bugTrackingBoard, limit)
 	}()
 
 	go func() {
 		defer wg.Done()
-		trackedPulls, errP = client.GetProjectItems(ctx, "kubescape", prTrackingBoard, limit)
+		prItems, errP = client.GetProjectItemsWithState(ctx, "kubescape", prTrackingBoard, limit)
 	}()
 
 	wg.Wait()
@@ -489,6 +634,15 @@ func Run(ctx context.Context, client GHClient) {
 	}
 	if errP != nil {
 		panic(errP)
+	}
+
+	trackedIssues := mapset.NewSet[string]()
+	for _, item := range bugItems {
+		trackedIssues.Add(item.URL)
+	}
+	trackedPulls := mapset.NewSet[string]()
+	for _, item := range prItems {
+		trackedPulls.Add(item.URL)
 	}
 
 	fmt.Println("tracked issues", trackedIssues.Cardinality())
@@ -570,6 +724,69 @@ func Run(ctx context.Context, client GHClient) {
 					fmt.Println("error adding pr", url, err)
 				} else {
 					fmt.Println("added pr", url)
+				}
+			})
+		}
+		wp.StopWait()
+	}()
+
+	wg.Wait()
+
+	// Archive closed/merged items on both boards
+	var bugFieldID, bugOptionID, prFieldID, prOptionID string
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		bugFieldID, bugOptionID, errBug = client.GetToArchiveFieldOption(ctx, "kubescape", bugTrackingBoard)
+	}()
+	go func() {
+		defer wg.Done()
+		prFieldID, prOptionID, errPR = client.GetToArchiveFieldOption(ctx, "kubescape", prTrackingBoard)
+	}()
+	wg.Wait()
+	if errBug != nil {
+		panic(errBug)
+	}
+	if errPR != nil {
+		panic(errPR)
+	}
+
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		wp := workerpool.New(runtime.GOMAXPROCS(0) * 4)
+		for _, item := range bugItems {
+			item := item
+			if !item.Closed {
+				continue
+			}
+			wp.Submit(func() {
+				err := client.UpdateProjectItemField(ctx, bugProjectID, item.ID, bugFieldID, bugOptionID)
+				if err != nil {
+					fmt.Println("error archiving issue", item.URL, err)
+				} else {
+					fmt.Println("archived issue", item.URL)
+				}
+			})
+		}
+		wp.StopWait()
+	}()
+
+	go func() {
+		defer wg.Done()
+		wp := workerpool.New(runtime.GOMAXPROCS(0) * 4)
+		for _, item := range prItems {
+			item := item
+			if !item.Closed {
+				continue
+			}
+			wp.Submit(func() {
+				err := client.UpdateProjectItemField(ctx, prProjectID, item.ID, prFieldID, prOptionID)
+				if err != nil {
+					fmt.Println("error archiving pr", item.URL, err)
+				} else {
+					fmt.Println("archived pr", item.URL)
 				}
 			})
 		}
