@@ -123,7 +123,7 @@ func (c *RealGHClient) GetContentID(ctx context.Context, urlStr string) (string,
 			"repo":   githubv4.String(repo),
 			"number": githubv4.Int(parsePullNumber(number)),
 		}
-		err = c.v4Client.Query(ctx, &query, variables)
+		err = withRetry(func() error { return c.v4Client.Query(ctx, &query, variables) })
 		if err != nil {
 			return "", err
 		}
@@ -144,7 +144,7 @@ func (c *RealGHClient) GetContentID(ctx context.Context, urlStr string) (string,
 		"number": githubv4.Int(parsePullNumber(number)),
 	}
 
-	err = c.v4Client.Query(ctx, &query, variables)
+	err = withRetry(func() error { return c.v4Client.Query(ctx, &query, variables) })
 	if err != nil {
 		return "", err
 	}
@@ -154,6 +154,32 @@ func (c *RealGHClient) GetContentID(ctx context.Context, urlStr string) (string,
 func parsePullNumber(s string) int {
 	n, _ := strconv.Atoi(s)
 	return n
+}
+
+func isTransientError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "temporary conflict") || strings.Contains(s, "Something went wrong")
+}
+
+func withRetry(fn func() error) error {
+	const maxRetries = 5
+	backoff := 500 * time.Millisecond
+	for i := range maxRetries {
+		err := fn()
+		if err == nil {
+			return nil
+		}
+		if i < maxRetries-1 && isTransientError(err) {
+			time.Sleep(backoff)
+			backoff *= 2
+			continue
+		}
+		return err
+	}
+	return nil
 }
 
 func (c *RealGHClient) AddProjectItemWithIDs(ctx context.Context, projectID, contentID string) error {
@@ -176,21 +202,7 @@ func (c *RealGHClient) AddProjectItemWithIDs(ctx context.Context, projectID, con
 		ContentID: githubv4.ID(contentID),
 	}
 
-	const maxRetries = 5
-	backoff := 500 * time.Millisecond
-	for i := range maxRetries {
-		err := c.v4Client.Mutate(ctx, &mutation, input, nil)
-		if err == nil {
-			return nil
-		}
-		if i < maxRetries-1 && strings.Contains(err.Error(), "temporary conflict") {
-			time.Sleep(backoff)
-			backoff *= 2
-			continue
-		}
-		return err
-	}
-	return nil
+	return withRetry(func() error { return c.v4Client.Mutate(ctx, &mutation, input, nil) })
 }
 
 func (c *RealGHClient) AddProjectItem(ctx context.Context, owner, board, url string) error {
@@ -491,7 +503,7 @@ func (c *RealGHClient) UpdateProjectItemField(ctx context.Context, projectID, it
 		Value:     ProjectV2FieldValueInput{SingleSelectOptionID: optionID},
 	}
 
-	return c.v4Client.Mutate(ctx, &mutation, input, nil)
+	return withRetry(func() error { return c.v4Client.Mutate(ctx, &mutation, input, nil) })
 }
 
 func (c *RealGHClient) GetIssuesAndPulls(ctx context.Context, repo string, limit int) ([]string, []string, error) {
