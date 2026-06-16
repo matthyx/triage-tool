@@ -4,21 +4,22 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	mapset "github.com/deckarep/golang-set/v2"
 )
 
 type MockGHClient struct {
-	AddProjectItemFunc              func(ctx context.Context, owner, board, url string) error
-	GetProjectIDFunc                func(ctx context.Context, owner, board string) (string, error)
-	GetContentIDFunc                func(ctx context.Context, url string) (string, error)
-	AddProjectItemWithIDsFunc       func(ctx context.Context, projectID, contentID string) error
-	GetProjectItemsWithStateFunc    func(ctx context.Context, owner, board string, limit int) ([]ProjectItem, error)
-	GetBothProjectItemsFunc         func(ctx context.Context, owner, bugBoard, prBoard string, limit int) (mapset.Set[string], mapset.Set[string], error)
-	GetIssuesAndPullsFunc           func(ctx context.Context, repo string, limit int) ([]string, []string, error)
-	GetRepositoriesFunc             func(ctx context.Context, owner string, limit int) ([]string, error)
-	GetToArchiveFieldOptionFunc     func(ctx context.Context, owner, board string) (string, string, error)
-	UpdateProjectItemFieldFunc      func(ctx context.Context, projectID, itemID, fieldID, optionID string) error
+	AddProjectItemFunc           func(ctx context.Context, owner, board, url string) error
+	GetProjectIDFunc             func(ctx context.Context, owner, board string) (string, error)
+	GetContentIDFunc             func(ctx context.Context, url string) (string, error)
+	AddProjectItemWithIDsFunc    func(ctx context.Context, projectID, contentID string) error
+	GetProjectItemsWithStateFunc func(ctx context.Context, owner, board string, limit int) ([]ProjectItem, error)
+	GetBothProjectItemsFunc      func(ctx context.Context, owner, bugBoard, prBoard string, limit int) (mapset.Set[string], mapset.Set[string], error)
+	GetIssuesAndPullsFunc        func(ctx context.Context, repo string, limit int) ([]string, []PullRequestDetail, error)
+	GetRepositoriesFunc          func(ctx context.Context, owner string, limit int) ([]string, error)
+	GetToArchiveFieldOptionFunc  func(ctx context.Context, owner, board string) (string, string, error)
+	UpdateProjectItemFieldFunc   func(ctx context.Context, projectID, itemID, fieldID, optionID string) error
 }
 
 func (m *MockGHClient) AddProjectItem(ctx context.Context, owner, board, url string) error {
@@ -45,7 +46,7 @@ func (m *MockGHClient) GetBothProjectItems(ctx context.Context, owner, bugBoard,
 	return m.GetBothProjectItemsFunc(ctx, owner, bugBoard, prBoard, limit)
 }
 
-func (m *MockGHClient) GetIssuesAndPulls(ctx context.Context, repo string, limit int) ([]string, []string, error) {
+func (m *MockGHClient) GetIssuesAndPulls(ctx context.Context, repo string, limit int) ([]string, []PullRequestDetail, error) {
 	return m.GetIssuesAndPullsFunc(ctx, repo, limit)
 }
 
@@ -62,7 +63,7 @@ func (m *MockGHClient) UpdateProjectItemField(ctx context.Context, projectID, it
 }
 
 func TestRun(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	var mu sync.Mutex
 	addedByProject := map[string]int{}
 
@@ -70,8 +71,27 @@ func TestRun(t *testing.T) {
 		GetRepositoriesFunc: func(ctx context.Context, owner string, limit int) ([]string, error) {
 			return []string{"kubescape/repo1"}, nil
 		},
-		GetIssuesAndPullsFunc: func(ctx context.Context, repo string, limit int) ([]string, []string, error) {
-			return []string{"https://github.com/kubescape/repo1/issues/1"}, []string{"https://github.com/kubescape/repo1/pull/1"}, nil
+		GetIssuesAndPullsFunc: func(ctx context.Context, repo string, limit int) ([]string, []PullRequestDetail, error) {
+			return []string{"https://github.com/kubescape/repo1/issues/1"}, []PullRequestDetail{
+				{
+					URL:            "https://github.com/kubescape/repo1/pull/1",
+					Title:          "Stale PR (10 days)",
+					Repository:     repo,
+					IsDraft:        false,
+					UpdatedAt:      time.Now().Add(-10 * 24 * time.Hour),
+					ReviewDecision: "REVIEW_REQUIRED",
+					CIState:        "SUCCESS",
+				},
+				{
+					URL:            "https://github.com/kubescape/repo1/pull/2",
+					Title:          "Stale PR (8 days)",
+					Repository:     repo,
+					IsDraft:        false,
+					UpdatedAt:      time.Now().Add(-8 * 24 * time.Hour),
+					ReviewDecision: "REVIEW_REQUIRED",
+					CIState:        "SUCCESS",
+				},
+			}, nil
 		},
 		GetProjectItemsWithStateFunc: func(ctx context.Context, owner, board string, limit int) ([]ProjectItem, error) {
 			return []ProjectItem{}, nil
@@ -104,7 +124,7 @@ func TestRun(t *testing.T) {
 	if addedByProject["project-"+bugTrackingBoard] != 1 {
 		t.Errorf("expected 1 added issue, got %d", addedByProject["project-"+bugTrackingBoard])
 	}
-	if addedByProject["project-"+prTrackingBoard] != 1 {
-		t.Errorf("expected 1 added pull, got %d", addedByProject["project-"+prTrackingBoard])
+	if addedByProject["project-"+prTrackingBoard] != 2 {
+		t.Errorf("expected 2 added pulls, got %d", addedByProject["project-"+prTrackingBoard])
 	}
 }

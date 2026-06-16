@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,9 +21,20 @@ import (
 )
 
 const (
-	bugTrackingBoard = "4"
-	prTrackingBoard  = "5"
+	bugTrackingBoard   = "4"
+	prTrackingBoard    = "5"
+	staleThresholdDays = 7
 )
+
+type PullRequestDetail struct {
+	URL            string
+	Title          string
+	Repository     string
+	IsDraft        bool
+	UpdatedAt      time.Time
+	ReviewDecision string
+	CIState        string
+}
 
 type GHClient interface {
 	AddProjectItem(ctx context.Context, owner, board, url string) error
@@ -31,7 +43,7 @@ type GHClient interface {
 	AddProjectItemWithIDs(ctx context.Context, projectID, contentID string) error
 	GetProjectItemsWithState(ctx context.Context, owner, board string, limit int) ([]ProjectItem, error)
 	GetBothProjectItems(ctx context.Context, owner, bugBoard, prBoard string, limit int) (mapset.Set[string], mapset.Set[string], error)
-	GetIssuesAndPulls(ctx context.Context, repo string, limit int) ([]string, []string, error)
+	GetIssuesAndPulls(ctx context.Context, repo string, limit int) ([]string, []PullRequestDetail, error)
 	GetRepositories(ctx context.Context, owner string, limit int) ([]string, error)
 	GetToArchiveFieldOption(ctx context.Context, owner, board string) (fieldID, optionID string, err error)
 	UpdateProjectItemField(ctx context.Context, projectID, itemID, fieldID, optionID string) error
@@ -82,7 +94,7 @@ func (c *RealGHClient) GetProjectID(ctx context.Context, owner, board string) (s
 	}
 
 	boardNum, _ := strconv.Atoi(board)
-	variables := map[string]interface{}{
+	variables := map[string]any{
 		"owner": githubv4.String(owner),
 		"board": githubv4.Int(boardNum),
 	}
@@ -118,7 +130,7 @@ func (c *RealGHClient) GetContentID(ctx context.Context, urlStr string) (string,
 				} `graphql:"issue(number: $number)"`
 			} `graphql:"repository(owner: $owner, name: $repo)"`
 		}
-		variables := map[string]interface{}{
+		variables := map[string]any{
 			"owner":  githubv4.String(owner),
 			"repo":   githubv4.String(repo),
 			"number": githubv4.Int(parsePullNumber(number)),
@@ -138,7 +150,7 @@ func (c *RealGHClient) GetContentID(ctx context.Context, urlStr string) (string,
 		} `graphql:"repository(owner: $owner, name: $repo)"`
 	}
 
-	variables := map[string]interface{}{
+	variables := map[string]any{
 		"owner":  githubv4.String(owner),
 		"repo":   githubv4.String(repo),
 		"number": githubv4.Int(parsePullNumber(number)),
@@ -255,7 +267,7 @@ func (c *RealGHClient) GetBothProjectItems(ctx context.Context, owner, bugBoard,
 
 	bugBoardNum, _ := strconv.Atoi(bugBoard)
 	prBoardNum, _ := strconv.Atoi(prBoard)
-	variables := map[string]interface{}{
+	variables := map[string]any{
 		"owner":    githubv4.String(owner),
 		"bugBoard": githubv4.Int(bugBoardNum),
 		"prBoard":  githubv4.Int(prBoardNum),
@@ -316,7 +328,7 @@ func (c *RealGHClient) GetProjectItems(ctx context.Context, owner, board string,
 		}
 
 		boardNum, _ := strconv.Atoi(board)
-		variables := map[string]interface{}{
+		variables := map[string]any{
 			"owner":  githubv4.String(owner),
 			"board":  githubv4.Int(boardNum),
 			"limit":  githubv4.Int(limit),
@@ -339,8 +351,7 @@ func (c *RealGHClient) GetProjectItems(ctx context.Context, owner, board string,
 		if !query.Organization.ProjectV2.Items.PageInfo.HasNextPage {
 			break
 		}
-		endCursor := query.Organization.ProjectV2.Items.PageInfo.EndCursor
-		cursor = &endCursor
+		cursor = new(query.Organization.ProjectV2.Items.PageInfo.EndCursor)
 	}
 
 	return urls, nil
@@ -385,7 +396,7 @@ func (c *RealGHClient) GetProjectItemsWithState(ctx context.Context, owner, boar
 		}
 
 		boardNum, _ := strconv.Atoi(board)
-		variables := map[string]interface{}{
+		variables := map[string]any{
 			"owner":  githubv4.String(owner),
 			"board":  githubv4.Int(boardNum),
 			"limit":  githubv4.Int(limit),
@@ -431,8 +442,7 @@ func (c *RealGHClient) GetProjectItemsWithState(ctx context.Context, owner, boar
 		if !query.Organization.ProjectV2.Items.PageInfo.HasNextPage {
 			break
 		}
-		endCursor := query.Organization.ProjectV2.Items.PageInfo.EndCursor
-		cursor = &endCursor
+		cursor = new(query.Organization.ProjectV2.Items.PageInfo.EndCursor)
 	}
 
 	return items, nil
@@ -459,7 +469,7 @@ func (c *RealGHClient) GetToArchiveFieldOption(ctx context.Context, owner, board
 	}
 
 	boardNum, _ := strconv.Atoi(board)
-	variables := map[string]interface{}{
+	variables := map[string]any{
 		"owner": githubv4.String(owner),
 		"board": githubv4.Int(boardNum),
 	}
@@ -506,9 +516,9 @@ func (c *RealGHClient) UpdateProjectItemField(ctx context.Context, projectID, it
 	return withRetry(func() error { return c.v4Client.Mutate(ctx, &mutation, input, nil) })
 }
 
-func (c *RealGHClient) GetIssuesAndPulls(ctx context.Context, repo string, limit int) ([]string, []string, error) {
-	slashIdx := strings.IndexByte(repo, '/')
-	if slashIdx < 0 {
+func (c *RealGHClient) GetIssuesAndPulls(ctx context.Context, repo string, limit int) ([]string, []PullRequestDetail, error) {
+	owner, name, ok := strings.Cut(repo, "/")
+	if !ok {
 		return nil, nil, fmt.Errorf("invalid repo format: %s", repo)
 	}
 
@@ -521,15 +531,28 @@ func (c *RealGHClient) GetIssuesAndPulls(ctx context.Context, repo string, limit
 			} `graphql:"issues(first: $limit, states: OPEN)"`
 			PullRequests struct {
 				Nodes []struct {
-					URL string
+					URL            string
+					Title          string
+					IsDraft        bool
+					UpdatedAt      time.Time
+					ReviewDecision string
+					Commits        struct {
+						Nodes []struct {
+							Commit struct {
+								StatusCheckRollup struct {
+									State string
+								}
+							}
+						}
+					} `graphql:"commits(last: 1)"`
 				}
 			} `graphql:"pullRequests(first: $limit, states: OPEN)"`
 		} `graphql:"repository(owner: $owner, name: $name)"`
 	}
 
-	variables := map[string]interface{}{
-		"owner": githubv4.String(repo[:slashIdx]),
-		"name":  githubv4.String(repo[slashIdx+1:]),
+	variables := map[string]any{
+		"owner": githubv4.String(owner),
+		"name":  githubv4.String(name),
 		"limit": githubv4.Int(limit),
 	}
 
@@ -543,9 +566,21 @@ func (c *RealGHClient) GetIssuesAndPulls(ctx context.Context, repo string, limit
 		issues[i] = issue.URL
 	}
 
-	pulls := make([]string, len(query.Repository.PullRequests.Nodes))
+	pulls := make([]PullRequestDetail, len(query.Repository.PullRequests.Nodes))
 	for i, pr := range query.Repository.PullRequests.Nodes {
-		pulls[i] = pr.URL
+		ciState := ""
+		if len(pr.Commits.Nodes) > 0 {
+			ciState = pr.Commits.Nodes[0].Commit.StatusCheckRollup.State
+		}
+		pulls[i] = PullRequestDetail{
+			URL:            pr.URL,
+			Title:          pr.Title,
+			Repository:     repo,
+			IsDraft:        pr.IsDraft,
+			UpdatedAt:      pr.UpdatedAt,
+			ReviewDecision: pr.ReviewDecision,
+			CIState:        ciState,
+		}
 	}
 	return issues, pulls, nil
 }
@@ -555,7 +590,7 @@ func (c *RealGHClient) GetIssues(ctx context.Context, repo string, limit int) ([
 	return issues, err
 }
 
-func (c *RealGHClient) GetPulls(ctx context.Context, repo string, limit int) ([]string, error) {
+func (c *RealGHClient) GetPulls(ctx context.Context, repo string, limit int) ([]PullRequestDetail, error) {
 	_, pulls, err := c.GetIssuesAndPulls(ctx, repo, limit)
 	return pulls, err
 }
@@ -571,7 +606,7 @@ func (c *RealGHClient) GetRepositories(ctx context.Context, owner string, limit 
 		} `graphql:"organization(login: $owner)"`
 	}
 
-	variables := map[string]interface{}{
+	variables := map[string]any{
 		"owner": githubv4.String(owner),
 		"limit": githubv4.Int(limit),
 	}
@@ -612,11 +647,10 @@ func Run(ctx context.Context, client GHClient) {
 	}
 
 	issueChan := make(chan []string, max(runtime.GOMAXPROCS(0), len(repositories)))
-	pullChan := make(chan []string, max(runtime.GOMAXPROCS(0), len(repositories)))
+	pullChan := make(chan []PullRequestDetail, max(runtime.GOMAXPROCS(0), len(repositories)))
 	wp := workerpool.New(runtime.GOMAXPROCS(0) * 4)
 
 	for _, repo := range repositories {
-		repo := repo
 		wp.Submit(func() {
 			issues, pulls, err := client.GetIssuesAndPulls(ctx, repo, limit)
 			if err != nil {
@@ -637,12 +671,16 @@ func Run(ctx context.Context, client GHClient) {
 
 	allIssues := mapset.NewSet[string]()
 	allPulls := mapset.NewSet[string]()
+	allPRDetails := make(map[string]PullRequestDetail)
 
 	for issues := range issueChan {
 		allIssues.Append(issues...)
 	}
 	for pulls := range pullChan {
-		allPulls.Append(pulls...)
+		for _, pr := range pulls {
+			allPulls.Add(pr.URL)
+			allPRDetails[pr.URL] = pr
+		}
 	}
 
 	fmt.Println("issues", allIssues.Cardinality())
@@ -651,18 +689,12 @@ func Run(ctx context.Context, client GHClient) {
 	var bugItems, prItems []ProjectItem
 	var errI, errP error
 	var wg sync.WaitGroup
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		bugItems, errI = client.GetProjectItemsWithState(ctx, "kubescape", bugTrackingBoard, limit)
-	}()
-
-	go func() {
-		defer wg.Done()
+	})
+	wg.Go(func() {
 		prItems, errP = client.GetProjectItemsWithState(ctx, "kubescape", prTrackingBoard, limit)
-	}()
-
+	})
 	wg.Wait()
 
 	if errI != nil {
@@ -703,15 +735,12 @@ func Run(ctx context.Context, client GHClient) {
 
 	var bugProjectID, prProjectID string
 	var errBug, errPR error
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		bugProjectID, errBug = client.GetProjectID(ctx, "kubescape", bugTrackingBoard)
-	}()
-	go func() {
-		defer wg.Done()
+	})
+	wg.Go(func() {
 		prProjectID, errPR = client.GetProjectID(ctx, "kubescape", prTrackingBoard)
-	}()
+	})
 	wg.Wait()
 	if errBug != nil {
 		panic(errBug)
@@ -720,13 +749,9 @@ func Run(ctx context.Context, client GHClient) {
 		panic(errPR)
 	}
 
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		wp := workerpool.New(runtime.GOMAXPROCS(0) * 4)
 		for _, url := range issueURLs {
-			url := url
 			wp.Submit(func() {
 				contentID, err := client.GetContentID(ctx, url)
 				if err != nil {
@@ -742,13 +767,10 @@ func Run(ctx context.Context, client GHClient) {
 			})
 		}
 		wp.StopWait()
-	}()
-
-	go func() {
-		defer wg.Done()
+	})
+	wg.Go(func() {
 		wp := workerpool.New(runtime.GOMAXPROCS(0) * 4)
 		for _, url := range prURLs {
-			url := url
 			wp.Submit(func() {
 				contentID, err := client.GetContentID(ctx, url)
 				if err != nil {
@@ -764,21 +786,17 @@ func Run(ctx context.Context, client GHClient) {
 			})
 		}
 		wp.StopWait()
-	}()
-
+	})
 	wg.Wait()
 
 	// Archive closed/merged items on both boards
 	var bugFieldID, bugOptionID, prFieldID, prOptionID string
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		bugFieldID, bugOptionID, errBug = client.GetToArchiveFieldOption(ctx, "kubescape", bugTrackingBoard)
-	}()
-	go func() {
-		defer wg.Done()
+	})
+	wg.Go(func() {
 		prFieldID, prOptionID, errPR = client.GetToArchiveFieldOption(ctx, "kubescape", prTrackingBoard)
-	}()
+	})
 	wg.Wait()
 	if errBug != nil {
 		panic(errBug)
@@ -787,13 +805,9 @@ func Run(ctx context.Context, client GHClient) {
 		panic(errPR)
 	}
 
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		wp := workerpool.New(runtime.GOMAXPROCS(0) * 4)
 		for _, item := range bugItems {
-			item := item
 			if !item.Closed || item.InArchive {
 				continue
 			}
@@ -807,13 +821,10 @@ func Run(ctx context.Context, client GHClient) {
 			})
 		}
 		wp.StopWait()
-	}()
-
-	go func() {
-		defer wg.Done()
+	})
+	wg.Go(func() {
 		wp := workerpool.New(runtime.GOMAXPROCS(0) * 4)
 		for _, item := range prItems {
-			item := item
 			if !item.Closed || item.InArchive {
 				continue
 			}
@@ -827,7 +838,80 @@ func Run(ctx context.Context, client GHClient) {
 			})
 		}
 		wp.StopWait()
-	}()
-
+	})
 	wg.Wait()
+
+	// Process and prioritize PRs needing attention
+	var failingCIPRs []PullRequestDetail
+	var approvedPRs []PullRequestDetail
+	var staleOrWaitingPRs []PullRequestDetail
+
+	now := time.Now()
+	for _, pr := range allPRDetails {
+		// Priority 1: Failing CI/CD
+		if pr.CIState == "FAILURE" || pr.CIState == "ERROR" {
+			failingCIPRs = append(failingCIPRs, pr)
+			continue
+		}
+		// Priority 2: Approved & Ready to Merge
+		if pr.ReviewDecision == "APPROVED" {
+			approvedPRs = append(approvedPRs, pr)
+			continue
+		}
+		// Priority 3: Stale / Waiting on Reviews
+		if pr.IsDraft {
+			continue
+		}
+		isStale := now.Sub(pr.UpdatedAt) > staleThresholdDays*24*time.Hour
+		isWaitingReview := pr.ReviewDecision == "REVIEW_REQUIRED"
+		if isStale || isWaitingReview {
+			staleOrWaitingPRs = append(staleOrWaitingPRs, pr)
+		}
+	}
+
+	slices.SortFunc(staleOrWaitingPRs, func(a, b PullRequestDetail) int {
+		return a.UpdatedAt.Compare(b.UpdatedAt)
+	})
+
+	fmt.Println()
+	fmt.Println("========================================================================")
+	fmt.Println("                       PULL REQUESTS NEEDING ATTENTION                  ")
+	fmt.Println("========================================================================")
+
+	if len(failingCIPRs) > 0 {
+		fmt.Println("\n🔴 FAILING CI/CD:")
+		for _, pr := range failingCIPRs {
+			daysStr := fmt.Sprintf("%.1f days ago", now.Sub(pr.UpdatedAt).Hours()/24.0)
+			fmt.Printf("  - [%s] %s\n    URL: %s\n    Last Updated: %s (%s)\n", pr.Repository, pr.Title, pr.URL, pr.UpdatedAt.Format("2006-01-02 15:04"), daysStr)
+		}
+	}
+
+	if len(approvedPRs) > 0 {
+		fmt.Println("\n🟢 APPROVED & READY TO MERGE:")
+		for _, pr := range approvedPRs {
+			daysStr := fmt.Sprintf("%.1f days ago", now.Sub(pr.UpdatedAt).Hours()/24.0)
+			fmt.Printf("  - [%s] %s\n    URL: %s\n    Last Updated: %s (%s)\n", pr.Repository, pr.Title, pr.URL, pr.UpdatedAt.Format("2006-01-02 15:04"), daysStr)
+		}
+	}
+
+	if len(staleOrWaitingPRs) > 0 {
+		fmt.Println("\n⏳ STALE OR WAITING ON REVIEWS:")
+		for _, pr := range staleOrWaitingPRs {
+			daysStr := fmt.Sprintf("%.1f days ago", now.Sub(pr.UpdatedAt).Hours()/24.0)
+			reason := fmt.Sprintf("Stale (%d+ days)", staleThresholdDays)
+			if pr.ReviewDecision == "REVIEW_REQUIRED" {
+				if now.Sub(pr.UpdatedAt) > staleThresholdDays*24*time.Hour {
+					reason = fmt.Sprintf("Stale (%d+ days) & Waiting on reviews", staleThresholdDays)
+				} else {
+					reason = "Waiting on reviews"
+				}
+			}
+			fmt.Printf("  - [%s] %s\n    URL: %s\n    Reason: %s\n    Last Updated: %s (%s)\n", pr.Repository, pr.Title, pr.URL, reason, pr.UpdatedAt.Format("2006-01-02 15:04"), daysStr)
+		}
+	}
+
+	if len(failingCIPRs) == 0 && len(approvedPRs) == 0 && len(staleOrWaitingPRs) == 0 {
+		fmt.Println("\n🎉 All PRs are in a great state! No pull requests currently need attention.")
+	}
+	fmt.Println("========================================================================")
 }
