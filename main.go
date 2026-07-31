@@ -21,19 +21,49 @@ import (
 )
 
 const (
-	bugTrackingBoard   = "4"
-	prTrackingBoard    = "5"
-	staleThresholdDays = 7
+	bugTrackingBoard      = "4"
+	prTrackingBoard       = "5"
+	staleThresholdDays    = 7
+	meLogin               = "matthyx"
+	statusFieldName       = "Status"
+	statusToArchive       = "To Archive"
+	statusWaitingOnAuthor = "Waiting on Author"
+	statusNeedsReviewer   = "Needs Reviewer"
+	commentHistoryLimit   = 30
 )
+
+// routableStatuses are the only current statuses the routing rule may overwrite.
+// "To Archive" is deliberately absent: a human can park an open PR there to mean
+// "stop showing me this", and routing must not yank it back out.
+var routableStatuses = []string{"", statusWaitingOnAuthor, statusNeedsReviewer}
+
+// CommentEvent is one conversation event, already stripped of GraphQL shapes.
+type CommentEvent struct {
+	Login string
+	IsBot bool
+}
+
+// actor selects the Actor interface's login plus its concrete type. A deleted
+// account yields a null author, hence the zero value and Typename == "".
+type actor struct {
+	Login    string
+	Typename string `graphql:"__typename"`
+}
+
+// isHuman reports whether the actor is a real user account. Anything else -
+// Bot, Organization, Mannequin, EnterpriseUserAccount, or a null author - is not.
+func (a actor) isHuman() bool { return a.Typename == "User" }
 
 type PullRequestDetail struct {
 	URL            string
 	Title          string
 	Repository     string
+	Author         string
 	IsDraft        bool
 	UpdatedAt      time.Time
 	ReviewDecision string
 	CIState        string
+	Conversation   []CommentEvent // oldest first
 }
 
 type GHClient interface {
@@ -46,15 +76,49 @@ type GHClient interface {
 	GetIssuesAndPulls(ctx context.Context, repo string, limit int) ([]string, []PullRequestDetail, error)
 	GetRepositories(ctx context.Context, owner string, limit int) ([]string, error)
 	GetToArchiveFieldOption(ctx context.Context, owner, board string) (fieldID, optionID string, err error)
+	GetSingleSelectOptions(ctx context.Context, owner, board string) (map[string]FieldOption, error)
 	UpdateProjectItemField(ctx context.Context, projectID, itemID, fieldID, optionID string) error
 }
 
-type ProjectItem struct {
-	ID        string
-	URL       string
-	Closed    bool
-	InArchive bool
+// FieldOption identifies one option of a single-select project field.
+type FieldOption struct {
+	FieldID   string
+	OptionID  string
+	FieldName string
 }
+
+type ProjectItem struct {
+	ID         string
+	URL        string
+	Closed     bool
+	InArchive  bool
+	StatusName string // current single-select status value, "" when unset
+}
+
+// singleSelectValue is one ProjectV2ItemFieldSingleSelectValue on an item.
+type singleSelectValue struct {
+	FieldName  string // owning field's name; "" when the fragment yields nothing
+	OptionName string // the selected option's name
+}
+
+// resolveStatusName picks the item's current status from its single-select values.
+func resolveStatusName(values []singleSelectValue) string {
+	for _, v := range values {
+		if v.FieldName == statusFieldName {
+			return v.OptionName
+		}
+	}
+	// Fall back to the field-name-agnostic matching the archive rule already uses.
+	for _, v := range values {
+		if slices.Contains(managedStatuses, v.OptionName) {
+			return v.OptionName
+		}
+	}
+	return ""
+}
+
+// managedStatuses are the status names this tool knows how to set.
+var managedStatuses = []string{statusToArchive, statusWaitingOnAuthor, statusNeedsReviewer}
 
 type RealGHClient struct {
 	v4Client *githubv4.Client
@@ -166,6 +230,44 @@ func (c *RealGHClient) GetContentID(ctx context.Context, urlStr string) (string,
 func parsePullNumber(s string) int {
 	n, _ := strconv.Atoi(s)
 	return n
+}
+
+// botLogins are actors whose comments never count as a human reply. This is
+// secondary to the __typename check and only catches human-typed service accounts.
+var botLogins = map[string]struct{}{
+	"dependabot": {}, "github-actions": {}, "codecov": {},
+	"renovate": {}, "sonarcloud": {}, "copilot-pull-request-reviewer": {},
+	"coderabbitai": {},
+}
+
+func isBotLogin(login string) bool {
+	if _, ok := botLogins[login]; ok {
+		return true
+	}
+	return strings.HasSuffix(login, "[bot]")
+}
+
+// classifyReviewStatus returns the target column name for a PR given its
+// chronological (oldest first) conversation, or "" when no move applies.
+func classifyReviewStatus(events []CommentEvent, me string) string {
+	var humans []CommentEvent
+	for _, e := range events {
+		if e.IsBot || isBotLogin(e.Login) {
+			continue
+		}
+		humans = append(humans, e)
+	}
+	if len(humans) == 0 {
+		return ""
+	}
+	if humans[len(humans)-1].Login == me {
+		return statusWaitingOnAuthor
+	}
+	// me participated and someone else spoke last, so me was replied to.
+	if slices.ContainsFunc(humans, func(e CommentEvent) bool { return e.Login == me }) {
+		return statusNeedsReviewer
+	}
+	return ""
 }
 
 func isTransientError(err error) bool {
@@ -381,10 +483,15 @@ func (c *RealGHClient) GetProjectItemsWithState(ctx context.Context, owner, boar
 							FieldValues struct {
 								Nodes []struct {
 									SingleSelectValue struct {
-										Name string
+										Name  string
+										Field struct {
+											SingleSelectField struct {
+												Name string
+											} `graphql:"... on ProjectV2SingleSelectField"`
+										}
 									} `graphql:"... on ProjectV2ItemFieldSingleSelectValue"`
 								}
-							} `graphql:"fieldValues(first: 10)"`
+							} `graphql:"fieldValues(first: 20)"`
 						}
 						PageInfo struct {
 							HasNextPage bool
@@ -431,11 +538,22 @@ func (c *RealGHClient) GetProjectItemsWithState(ctx context.Context, owner, boar
 					break
 				}
 			}
+			var values []singleSelectValue
+			for _, fv := range node.FieldValues.Nodes {
+				if fv.SingleSelectValue.Name == "" {
+					continue
+				}
+				values = append(values, singleSelectValue{
+					FieldName:  fv.SingleSelectValue.Field.SingleSelectField.Name,
+					OptionName: fv.SingleSelectValue.Name,
+				})
+			}
 			items = append(items, ProjectItem{
-				ID:        node.ID,
-				URL:       url,
-				Closed:    state == "CLOSED" || state == "MERGED",
-				InArchive: inArchive,
+				ID:         node.ID,
+				URL:        url,
+				Closed:     state == "CLOSED" || state == "MERGED",
+				InArchive:  inArchive,
+				StatusName: resolveStatusName(values),
 			})
 		}
 
@@ -448,7 +566,7 @@ func (c *RealGHClient) GetProjectItemsWithState(ctx context.Context, owner, boar
 	return items, nil
 }
 
-func (c *RealGHClient) GetToArchiveFieldOption(ctx context.Context, owner, board string) (string, string, error) {
+func (c *RealGHClient) GetSingleSelectOptions(ctx context.Context, owner, board string) (map[string]FieldOption, error) {
 	var query struct {
 		Organization struct {
 			ProjectV2 struct {
@@ -463,7 +581,7 @@ func (c *RealGHClient) GetToArchiveFieldOption(ctx context.Context, owner, board
 							}
 						} `graphql:"... on ProjectV2SingleSelectField"`
 					}
-				} `graphql:"fields(first: 20)"`
+				} `graphql:"fields(first: 50)"`
 			} `graphql:"projectV2(number: $board)"`
 		} `graphql:"organization(login: $owner)"`
 	}
@@ -476,15 +594,34 @@ func (c *RealGHClient) GetToArchiveFieldOption(ctx context.Context, owner, board
 
 	err := c.v4Client.Query(ctx, &query, variables)
 	if err != nil {
-		return "", "", err
+		return nil, err
 	}
 
+	options := make(map[string]FieldOption)
 	for _, node := range query.Organization.ProjectV2.Fields.Nodes {
 		for _, opt := range node.SingleSelectField.Options {
-			if opt.Name == "To Archive" {
-				return node.SingleSelectField.ID, opt.ID, nil
+			// First occurrence wins, preserving the original first-match semantics.
+			if existing, dup := options[opt.Name]; dup {
+				fmt.Printf("duplicate single-select option %q in board %s, keeping the one on field %q\n", opt.Name, board, existing.FieldName)
+				continue
+			}
+			options[opt.Name] = FieldOption{
+				FieldID:   node.SingleSelectField.ID,
+				OptionID:  opt.ID,
+				FieldName: node.SingleSelectField.Name,
 			}
 		}
+	}
+	return options, nil
+}
+
+func (c *RealGHClient) GetToArchiveFieldOption(ctx context.Context, owner, board string) (string, string, error) {
+	opts, err := c.GetSingleSelectOptions(ctx, owner, board)
+	if err != nil {
+		return "", "", err
+	}
+	if o, ok := opts[statusToArchive]; ok {
+		return o.FieldID, o.OptionID, nil
 	}
 	return "", "", fmt.Errorf("'To Archive' option not found in project board %s", board)
 }
@@ -536,6 +673,7 @@ func (c *RealGHClient) GetIssuesAndPulls(ctx context.Context, repo string, limit
 					IsDraft        bool
 					UpdatedAt      time.Time
 					ReviewDecision string
+					Author         actor
 					Commits        struct {
 						Nodes []struct {
 							Commit struct {
@@ -545,15 +683,29 @@ func (c *RealGHClient) GetIssuesAndPulls(ctx context.Context, repo string, limit
 							}
 						}
 					} `graphql:"commits(last: 1)"`
+					Comments struct {
+						Nodes []struct {
+							CreatedAt time.Time
+							Author    actor
+						}
+					} `graphql:"comments(last: $commentLimit)"`
+					Reviews struct {
+						Nodes []struct {
+							SubmittedAt time.Time
+							State       string
+							Author      actor
+						}
+					} `graphql:"reviews(last: $commentLimit)"`
 				}
 			} `graphql:"pullRequests(first: $limit, states: OPEN)"`
 		} `graphql:"repository(owner: $owner, name: $name)"`
 	}
 
 	variables := map[string]any{
-		"owner": githubv4.String(owner),
-		"name":  githubv4.String(name),
-		"limit": githubv4.Int(limit),
+		"owner":        githubv4.String(owner),
+		"name":         githubv4.String(name),
+		"limit":        githubv4.Int(limit),
+		"commentLimit": githubv4.Int(commentHistoryLimit),
 	}
 
 	err := c.v4Client.Query(ctx, &query, variables)
@@ -572,14 +724,42 @@ func (c *RealGHClient) GetIssuesAndPulls(ctx context.Context, repo string, limit
 		if len(pr.Commits.Nodes) > 0 {
 			ciState = pr.Commits.Nodes[0].Commit.StatusCheckRollup.State
 		}
+
+		type timedEvent struct {
+			at    time.Time
+			event CommentEvent
+		}
+		timed := make([]timedEvent, 0, len(pr.Comments.Nodes)+len(pr.Reviews.Nodes))
+		for _, c := range pr.Comments.Nodes {
+			timed = append(timed, timedEvent{c.CreatedAt, CommentEvent{Login: c.Author.Login, IsBot: !c.Author.isHuman()}})
+		}
+		for _, r := range pr.Reviews.Nodes {
+			// PENDING reviews are unsubmitted drafts, invisible to everyone else,
+			// and carry a null submittedAt.
+			if r.State == "PENDING" {
+				continue
+			}
+			timed = append(timed, timedEvent{r.SubmittedAt, CommentEvent{Login: r.Author.Login, IsBot: !r.Author.isHuman()}})
+		}
+		// Stable: a review and a comment can share a timestamp, and an unstable
+		// sort could flip which one is "last speaker" between runs.
+		slices.SortStableFunc(timed, func(a, b timedEvent) int { return a.at.Compare(b.at) })
+
+		conversation := make([]CommentEvent, len(timed))
+		for j, t := range timed {
+			conversation[j] = t.event
+		}
+
 		pulls[i] = PullRequestDetail{
 			URL:            pr.URL,
 			Title:          pr.Title,
 			Repository:     repo,
+			Author:         pr.Author.Login,
 			IsDraft:        pr.IsDraft,
 			UpdatedAt:      pr.UpdatedAt,
 			ReviewDecision: pr.ReviewDecision,
 			CIState:        ciState,
+			Conversation:   conversation,
 		}
 	}
 	return issues, pulls, nil
@@ -840,6 +1020,90 @@ func Run(ctx context.Context, client GHClient) {
 		wp.StopWait()
 	})
 	wg.Wait()
+
+	// Route open PRs between columns based on who spoke last in the conversation.
+	// Disabled loudly rather than guessed at when the board is not shaped as expected.
+	dryRun := os.Getenv("TRIAGE_ROUTING_DRY_RUN") != ""
+	prOptions, err := client.GetSingleSelectOptions(ctx, "kubescape", prTrackingBoard)
+
+	wa, okWA := prOptions[statusWaitingOnAuthor]
+	nr, okNR := prOptions[statusNeedsReviewer]
+	ta := prOptions[statusToArchive]
+
+	switch {
+	case err != nil:
+		fmt.Printf("routing disabled: %v\n", err)
+	case !okWA || !okNR:
+		fmt.Println(`routing disabled: board is missing "Waiting on Author" and/or "Needs Reviewer"`)
+	case wa.FieldID != nr.FieldID || wa.FieldID != ta.FieldID:
+		fmt.Println("routing options span multiple fields, disabling routing")
+	case wa.FieldName != statusFieldName:
+		fmt.Printf("status field is not named %q, disabling routing\n", statusFieldName)
+	default:
+		var mu sync.Mutex
+		var candidates, moved, alreadyInTarget, noSuchOption, skippedUnmanaged int
+		loggedMissingOption := map[string]bool{}
+
+		routeWP := workerpool.New(runtime.GOMAXPROCS(0) * 4)
+		for _, item := range prItems {
+			// prItems is stale in memory after the archive mutations, so closed
+			// items are excluded explicitly rather than by block ordering.
+			if item.Closed {
+				continue
+			}
+			if !slices.Contains(routableStatuses, item.StatusName) {
+				skippedUnmanaged++
+				continue
+			}
+			pr, ok := allPRDetails[item.URL]
+			if !ok {
+				continue
+			}
+			if pr.Author == meLogin || pr.ReviewDecision == "APPROVED" || pr.IsDraft {
+				continue
+			}
+			target := classifyReviewStatus(pr.Conversation, meLogin)
+			if target == "" {
+				continue
+			}
+			candidates++
+			if item.StatusName == target {
+				alreadyInTarget++
+				continue
+			}
+			opt, ok := prOptions[target]
+			if !ok {
+				noSuchOption++
+				if !loggedMissingOption[target] {
+					loggedMissingOption[target] = true
+					fmt.Printf("no %q option on the PR board\n", target)
+				}
+				continue
+			}
+			current := item.StatusName
+			if current == "" {
+				current = "(none)"
+			}
+			if dryRun {
+				fmt.Printf("would move pr %s from %q to %q\n", item.URL, current, target)
+				continue
+			}
+			routeWP.Submit(func() {
+				err := client.UpdateProjectItemField(ctx, prProjectID, item.ID, opt.FieldID, opt.OptionID)
+				mu.Lock()
+				defer mu.Unlock()
+				if err != nil {
+					fmt.Printf("error moving pr %s to %q: %v\n", item.URL, target, err)
+					return
+				}
+				moved++
+				fmt.Printf("moved pr %s from %q to %q\n", item.URL, current, target)
+			})
+		}
+		routeWP.StopWait()
+		fmt.Printf("routing: %d candidates, %d moved, %d already-in-target, %d no-such-option, %d skipped-unmanaged-status\n",
+			candidates, moved, alreadyInTarget, noSuchOption, skippedUnmanaged)
+	}
 
 	// Process and prioritize PRs needing attention
 	var failingCIPRs []PullRequestDetail
