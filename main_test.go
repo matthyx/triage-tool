@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -126,5 +127,80 @@ func TestRun(t *testing.T) {
 	}
 	if addedByProject["project-"+prTrackingBoard] != 2 {
 		t.Errorf("expected 2 added pulls, got %d", addedByProject["project-"+prTrackingBoard])
+	}
+}
+
+type fieldUpdate struct {
+	projectID string
+	itemID    string
+	fieldID   string
+	optionID  string
+}
+
+func TestArchiveClosedItems(t *testing.T) {
+	ctx := t.Context()
+	var mu sync.Mutex
+	var updates []fieldUpdate
+
+	mockClient := &MockGHClient{
+		GetRepositoriesFunc: func(ctx context.Context, owner string, limit int) ([]string, error) {
+			return []string{"kubescape/repo1"}, nil
+		},
+		GetIssuesAndPullsFunc: func(ctx context.Context, repo string, limit int) ([]string, []PullRequestDetail, error) {
+			return nil, nil, nil
+		},
+		GetProjectItemsWithStateFunc: func(ctx context.Context, owner, board string, limit int) ([]ProjectItem, error) {
+			switch board {
+			case bugTrackingBoard:
+				return []ProjectItem{
+					{ID: "bug-1", URL: "https://github.com/kubescape/repo1/issues/1", Closed: true, InArchive: false},
+					{ID: "bug-2", URL: "https://github.com/kubescape/repo1/issues/2", Closed: true, InArchive: true},
+					{ID: "bug-3", URL: "https://github.com/kubescape/repo1/issues/3", Closed: false, InArchive: false},
+				}, nil
+			case prTrackingBoard:
+				return []ProjectItem{
+					{ID: "pr-1", URL: "https://github.com/kubescape/repo1/pull/1", Closed: true, InArchive: false},
+					{ID: "pr-2", URL: "https://github.com/kubescape/repo1/pull/2", Closed: true, InArchive: true},
+					{ID: "pr-3", URL: "https://github.com/kubescape/repo1/pull/3", Closed: false, InArchive: false},
+				}, nil
+			}
+			return []ProjectItem{}, nil
+		},
+		GetProjectIDFunc: func(ctx context.Context, owner, board string) (string, error) {
+			return "project-" + board, nil
+		},
+		GetContentIDFunc: func(ctx context.Context, url string) (string, error) {
+			return "content-123", nil
+		},
+		AddProjectItemWithIDsFunc: func(ctx context.Context, projectID, contentID string) error {
+			return nil
+		},
+		AddProjectItemFunc: func(ctx context.Context, owner, board, url string) error {
+			return nil
+		},
+		GetToArchiveFieldOptionFunc: func(ctx context.Context, owner, board string) (string, string, error) {
+			return "field-123", "option-123", nil
+		},
+		UpdateProjectItemFieldFunc: func(ctx context.Context, projectID, itemID, fieldID, optionID string) error {
+			mu.Lock()
+			defer mu.Unlock()
+			updates = append(updates, fieldUpdate{projectID, itemID, fieldID, optionID})
+			return nil
+		},
+	}
+
+	Run(ctx, mockClient)
+
+	want := []fieldUpdate{
+		{"project-" + bugTrackingBoard, "bug-1", "field-123", "option-123"},
+		{"project-" + prTrackingBoard, "pr-1", "field-123", "option-123"},
+	}
+	if len(updates) != len(want) {
+		t.Fatalf("expected %d field updates, got %d: %+v", len(want), len(updates), updates)
+	}
+	for _, w := range want {
+		if !slices.Contains(updates, w) {
+			t.Errorf("missing expected field update %+v, got %+v", w, updates)
+		}
 	}
 }
