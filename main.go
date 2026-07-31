@@ -30,6 +30,21 @@ const (
 	statusWaitingOnAuthor = "Waiting on Author"
 	statusNeedsReviewer   = "Needs Reviewer"
 	commentHistoryLimit   = 30
+
+	// mergeableConflicting is the one MergeableState that means the author must
+	// act. MERGEABLE, UNKNOWN and "" are treated as absence of signal.
+	mergeableConflicting = "CONFLICTING"
+	// reviewChangesRequested is both a Review.state and a reviewDecision value.
+	reviewChangesRequested = "CHANGES_REQUESTED"
+	// reviewApproved is used by the stale-approved report only; the routing
+	// loop's own "APPROVED" literal is protected and stays as-is.
+	reviewApproved = "APPROVED"
+
+	// reason* are the routing reasons routeTarget can return. They exist so the
+	// printed line and the counter switch cannot drift apart by a typo.
+	reasonMergeConflict    = "merge-conflict"
+	reasonChangesRequested = "changes-requested"
+	reasonLastCommenter    = "last-commenter"
 )
 
 // routableStatuses are the only current statuses the routing rule may overwrite.
@@ -37,10 +52,19 @@ const (
 // "stop showing me this", and routing must not yank it back out.
 var routableStatuses = []string{"", statusWaitingOnAuthor, statusNeedsReviewer}
 
+// staleApprovedStatuses are the columns where an APPROVED open PR indicates a
+// stale label. Deliberately NOT routableStatuses: that set is under discussion
+// (re-adding "To Archive" is an open follow-up), and a human who parks an
+// approved PR in "To Archive" has curated it, not left it stale. "" is absent
+// for the same reason - a blank status is not a stale label.
+var staleApprovedStatuses = []string{statusWaitingOnAuthor, statusNeedsReviewer}
+
 // CommentEvent is one conversation event, already stripped of GraphQL shapes.
 type CommentEvent struct {
 	Login string
 	IsBot bool
+	At    time.Time // comment createdAt / review submittedAt
+	State string    // review state ("" for issue comments)
 }
 
 // actor selects the Actor interface's login plus its concrete type. A deleted
@@ -64,6 +88,8 @@ type PullRequestDetail struct {
 	ReviewDecision string
 	CIState        string
 	Conversation   []CommentEvent // oldest first
+	Mergeable      string         // MergeableState: "MERGEABLE" | "CONFLICTING" | "UNKNOWN" | ""
+	LastCommitAt   time.Time      // committedDate of the PR tip commit; zero when absent
 }
 
 type GHClient interface {
@@ -268,6 +294,93 @@ func classifyReviewStatus(events []CommentEvent, me string) string {
 		return statusNeedsReviewer
 	}
 	return ""
+}
+
+// newestChangeRequestAt returns the time of the newest non-bot CHANGES_REQUESTED
+// review in the conversation, and whether one was found. It is generic over the
+// reviewer: any human reviewer's change request counts, not just meLogin's, so
+// this function never references meLogin. It scans the whole slice rather than
+// assuming the caller sorted it.
+func newestChangeRequestAt(events []CommentEvent) (time.Time, bool) {
+	var newest time.Time
+	found := false
+	for _, e := range events {
+		if e.IsBot || isBotLogin(e.Login) {
+			continue
+		}
+		if e.State != reviewChangesRequested {
+			continue
+		}
+		if !found || e.At.After(newest) {
+			newest = e.At
+			found = true
+		}
+	}
+	return newest, found
+}
+
+// changesRequestedOutstanding reports whether the PR carries a change request that
+// the author has not yet addressed, per fork D3: addressed means either a commit
+// newer than the newest change request, or an event from the PR author after it.
+func changesRequestedOutstanding(pr PullRequestDetail) bool {
+	// GitHub's aggregate is the gate; nothing else can turn the pin on.
+	if pr.ReviewDecision != reviewChangesRequested {
+		return false
+	}
+	at, ok := newestChangeRequestAt(pr.Conversation)
+	if !ok {
+		// Window miss: reviewDecision says CHANGES_REQUESTED but no human change
+		// request is visible in the fetched window (full window / bot-only change
+		// request / all-dismissed). Pin conservatively.
+		return true
+	}
+	// D1: addressed by a push. The tip commit counts as an author action
+	// regardless of who actually committed it - a known-false simplification
+	// (kubescape/node-agent#808 has a tip commit by the reviewer). A false
+	// "addressed" only costs the new protection: routeTarget's P4 then returns
+	// classifyReviewStatus's own unmodified answer. A commit-authorship filter
+	// is a deliberate follow-up, not a v2 clause.
+	if !pr.LastCommitAt.IsZero() && pr.LastCommitAt.After(at) {
+		return false
+	}
+	// D2: addressed by a reply from the PR author.
+	for _, e := range pr.Conversation {
+		if !e.IsBot && !isBotLogin(e.Login) && e.Login == pr.Author && e.At.After(at) {
+			return false
+		}
+	}
+	return true
+}
+
+// routeTarget decides the column an open PR belongs in and why, applying the
+// signal precedence: last-commenter first as a gate, then merge conflict, then
+// an outstanding change request. Both overrides can only redirect a move toward
+// "Waiting on Author"; neither can create a move the last-commenter rule did not
+// already produce. Returns ("", "") when no move applies.
+//
+// It deliberately does not re-implement the routing loop's own guards (author,
+// approved, draft, closed, unmanaged status): those stay in the loop.
+func routeTarget(pr PullRequestDetail, me string) (string, string) {
+	// P0: the frozen last-commenter rule.
+	target := classifyReviewStatus(pr.Conversation, me)
+	// P1: MONOTONICITY GATE. No signal may create a routing candidate the
+	// last-commenter rule did not already produce. Everything below this line
+	// depends on it; weakening it to make a test pass is never the right fix.
+	if target == "" {
+		return "", ""
+	}
+	// P2: a merge conflict is a machine-verifiable fact, so it outranks P3 and
+	// owns the printed reason when both hold. UNKNOWN and "" are no signal.
+	if pr.Mergeable == mergeableConflicting {
+		return statusWaitingOnAuthor, reasonMergeConflict
+	}
+	// P3: an outstanding change request the author has not addressed.
+	if changesRequestedOutstanding(pr) {
+		return statusWaitingOnAuthor, reasonChangesRequested
+	}
+	// P4: the structural safety net. Whenever an override fails to fire for any
+	// reason, the answer is classifyReviewStatus's own, unchanged.
+	return target, reasonLastCommenter
 }
 
 func isTransientError(err error) bool {
@@ -673,10 +786,12 @@ func (c *RealGHClient) GetIssuesAndPulls(ctx context.Context, repo string, limit
 					IsDraft        bool
 					UpdatedAt      time.Time
 					ReviewDecision string
+					Mergeable      string
 					Author         actor
 					Commits        struct {
 						Nodes []struct {
 							Commit struct {
+								CommittedDate     time.Time
 								StatusCheckRollup struct {
 									State string
 								}
@@ -721,8 +836,10 @@ func (c *RealGHClient) GetIssuesAndPulls(ctx context.Context, repo string, limit
 	pulls := make([]PullRequestDetail, len(query.Repository.PullRequests.Nodes))
 	for i, pr := range query.Repository.PullRequests.Nodes {
 		ciState := ""
+		var lastCommitAt time.Time
 		if len(pr.Commits.Nodes) > 0 {
 			ciState = pr.Commits.Nodes[0].Commit.StatusCheckRollup.State
+			lastCommitAt = pr.Commits.Nodes[0].Commit.CommittedDate
 		}
 
 		type timedEvent struct {
@@ -731,7 +848,7 @@ func (c *RealGHClient) GetIssuesAndPulls(ctx context.Context, repo string, limit
 		}
 		timed := make([]timedEvent, 0, len(pr.Comments.Nodes)+len(pr.Reviews.Nodes))
 		for _, c := range pr.Comments.Nodes {
-			timed = append(timed, timedEvent{c.CreatedAt, CommentEvent{Login: c.Author.Login, IsBot: !c.Author.isHuman()}})
+			timed = append(timed, timedEvent{c.CreatedAt, CommentEvent{Login: c.Author.Login, IsBot: !c.Author.isHuman(), At: c.CreatedAt}})
 		}
 		for _, r := range pr.Reviews.Nodes {
 			// PENDING reviews are unsubmitted drafts, invisible to everyone else,
@@ -739,7 +856,7 @@ func (c *RealGHClient) GetIssuesAndPulls(ctx context.Context, repo string, limit
 			if r.State == "PENDING" {
 				continue
 			}
-			timed = append(timed, timedEvent{r.SubmittedAt, CommentEvent{Login: r.Author.Login, IsBot: !r.Author.isHuman()}})
+			timed = append(timed, timedEvent{r.SubmittedAt, CommentEvent{Login: r.Author.Login, IsBot: !r.Author.isHuman(), At: r.SubmittedAt, State: r.State}})
 		}
 		// Stable: a review and a comment can share a timestamp, and an unstable
 		// sort could flip which one is "last speaker" between runs.
@@ -760,6 +877,8 @@ func (c *RealGHClient) GetIssuesAndPulls(ctx context.Context, repo string, limit
 			ReviewDecision: pr.ReviewDecision,
 			CIState:        ciState,
 			Conversation:   conversation,
+			Mergeable:      pr.Mergeable,
+			LastCommitAt:   lastCommitAt,
 		}
 	}
 	return issues, pulls, nil
@@ -1021,6 +1140,28 @@ func Run(ctx context.Context, client GHClient) {
 	})
 	wg.Wait()
 
+	// Approved PRs are never routed (A8), so a column set before approval can go
+	// stale. Report them; correcting them needs a new disposition (plan fork C3).
+	// Runs regardless of the routing precondition below: it mutates nothing, and
+	// a misconfigured board must not suppress a zero-risk visibility feature.
+	staleApproved := 0
+	for _, item := range prItems {
+		if item.Closed || !slices.Contains(staleApprovedStatuses, item.StatusName) {
+			continue
+		}
+		pr, ok := allPRDetails[item.URL]
+		// IsDraft and Author == meLogin mirror the routing loop's own exemptions:
+		// neither is something the tool is telling matthyx to fix.
+		if !ok || pr.ReviewDecision != reviewApproved || pr.IsDraft || pr.Author == meLogin {
+			continue
+		}
+		staleApproved++
+		fmt.Printf("approved pr %s still in %q (routing does not manage approved PRs)\n", item.URL, item.StatusName)
+	}
+	if staleApproved > 0 {
+		fmt.Printf("stale-approved: %d approved pr(s) still in a managed column\n", staleApproved)
+	}
+
 	// Route open PRs between columns based on who spoke last in the conversation.
 	// Disabled loudly rather than guessed at when the board is not shaped as expected.
 	dryRun := os.Getenv("TRIAGE_ROUTING_DRY_RUN") != ""
@@ -1042,6 +1183,7 @@ func Run(ctx context.Context, client GHClient) {
 	default:
 		var mu sync.Mutex
 		var candidates, moved, alreadyInTarget, noSuchOption, skippedUnmanaged int
+		var byConflict, byChangesRequested int
 		loggedMissingOption := map[string]bool{}
 
 		routeWP := workerpool.New(runtime.GOMAXPROCS(0) * 4)
@@ -1062,13 +1204,31 @@ func Run(ctx context.Context, client GHClient) {
 			if pr.Author == meLogin || pr.ReviewDecision == "APPROVED" || pr.IsDraft {
 				continue
 			}
-			target := classifyReviewStatus(pr.Conversation, meLogin)
+			target, reason := routeTarget(pr, meLogin)
 			if target == "" {
 				continue
 			}
 			candidates++
+			// Counted here, above the disposition guards, so the counters mean
+			// "decisions produced by a new signal" - including PRs already in the
+			// right column. The keep-line below is what makes that population
+			// visible, keeping counters and printed lines 1:1. Both these
+			// increments and the keep-line run on the single-threaded loop
+			// goroutine (before routeWP.Submit), so they need no mutex; only
+			// moved is touched inside the worker closure under mu.
+			switch reason {
+			case reasonMergeConflict:
+				byConflict++
+			case reasonChangesRequested:
+				byChangesRequested++
+			}
 			if item.StatusName == target {
 				alreadyInTarget++
+				// Suppressed for last-commenter: those decisions are identical to
+				// pre-signal behaviour and print nothing today.
+				if reason != reasonLastCommenter {
+					fmt.Printf("keeping pr %s in %q (%s)\n", item.URL, item.StatusName, reason)
+				}
 				continue
 			}
 			opt, ok := prOptions[target]
@@ -1085,7 +1245,7 @@ func Run(ctx context.Context, client GHClient) {
 				current = "(none)"
 			}
 			if dryRun {
-				fmt.Printf("would move pr %s from %q to %q\n", item.URL, current, target)
+				fmt.Printf("would move pr %s from %q to %q (%s)\n", item.URL, current, target, reason)
 				continue
 			}
 			routeWP.Submit(func() {
@@ -1097,12 +1257,12 @@ func Run(ctx context.Context, client GHClient) {
 					return
 				}
 				moved++
-				fmt.Printf("moved pr %s from %q to %q\n", item.URL, current, target)
+				fmt.Printf("moved pr %s from %q to %q (%s)\n", item.URL, current, target, reason)
 			})
 		}
 		routeWP.StopWait()
-		fmt.Printf("routing: %d candidates, %d moved, %d already-in-target, %d no-such-option, %d skipped-unmanaged-status\n",
-			candidates, moved, alreadyInTarget, noSuchOption, skippedUnmanaged)
+		fmt.Printf("routing: %d candidates, %d moved, %d already-in-target, %d no-such-option, %d skipped-unmanaged-status, %d by-conflict, %d by-changes-requested\n",
+			candidates, moved, alreadyInTarget, noSuchOption, skippedUnmanaged, byConflict, byChangesRequested)
 	}
 
 	// Process and prioritize PRs needing attention

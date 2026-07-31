@@ -370,6 +370,21 @@ func prURL(n int) string {
 	return fmt.Sprintf("https://github.com/kubescape/repo1/pull/%d", n)
 }
 
+// at builds a timestamped human conversation event. The client()-local human()
+// and bot() closures are byte-identical-protected, so timestamped fixtures get
+// their own package-level helpers rather than extending those.
+func at(t time.Time, login string) CommentEvent { return CommentEvent{Login: login, At: t} }
+
+// cr builds a timestamped human CHANGES_REQUESTED review event.
+func cr(t time.Time, login string) CommentEvent {
+	return CommentEvent{Login: login, At: t, State: reviewChangesRequested}
+}
+
+// botAt builds a timestamped bot conversation event.
+func botAt(t time.Time, login string) CommentEvent {
+	return CommentEvent{Login: login, IsBot: true, At: t}
+}
+
 // routingFixture is the shared board/PR fixture for the routing tests. The
 // board-5 items and their PR details are chosen so that exactly one guard
 // applies to each, making a missed guard visible as an extra mutation.
@@ -381,6 +396,12 @@ type routingFixture struct {
 
 	options    map[string]FieldOption
 	optionsErr error
+
+	// extraPRs/extraItems are appended to the ten base rows so new cases can be
+	// added without touching them. Empty by default, so every pre-existing test
+	// behaves exactly as before.
+	extraPRs   []PullRequestDetail
+	extraItems []ProjectItem
 }
 
 func newRoutingFixture() *routingFixture {
@@ -435,6 +456,9 @@ func (f *routingFixture) client() *MockGHClient {
 		{ID: "pr-9", URL: prURL(9)},
 		{ID: "pr-10", URL: prURL(10)},
 	}
+
+	prs = append(prs, f.extraPRs...)
+	items = append(items, f.extraItems...)
 
 	return &MockGHClient{
 		GetRepositoriesFunc: func(ctx context.Context, owner string, limit int) ([]string, error) {
@@ -626,4 +650,494 @@ func TestRunRoutingDisabledOnMisconfiguredBoard(t *testing.T) {
 			}
 		})
 	}
+}
+
+// signalBase is the fixed reference time the signal fixtures hang off, so the
+// before/after relationships in them are exact rather than wall-clock dependent.
+var signalBase = time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+
+func TestChangesRequestedOutstanding(t *testing.T) {
+	base := signalBase
+	tests := []struct {
+		name string
+		pr   PullRequestDetail
+		want bool
+	}{
+		{
+			name: "review decision is not CHANGES_REQUESTED",
+			pr: PullRequestDetail{Author: "author", ReviewDecision: "APPROVED",
+				Conversation: []CommentEvent{cr(base, meLogin)}},
+			want: false,
+		},
+		{
+			name: "change request with nothing after it",
+			pr: PullRequestDetail{Author: "author", ReviewDecision: reviewChangesRequested,
+				Conversation: []CommentEvent{cr(base, meLogin)}},
+			want: true,
+		},
+		{
+			name: "addressed by a later commit",
+			pr: PullRequestDetail{Author: "author", ReviewDecision: reviewChangesRequested,
+				Conversation: []CommentEvent{cr(base, meLogin)}, LastCommitAt: base.Add(time.Hour)},
+			want: false,
+		},
+		{
+			name: "addressed by a later author comment",
+			pr: PullRequestDetail{Author: "author", ReviewDecision: reviewChangesRequested,
+				Conversation: []CommentEvent{cr(base, meLogin), at(base.Add(time.Hour), "author")}},
+			want: false,
+		},
+		{
+			// The reported G2 gap: a third party speaking last must not read as
+			// the author having addressed anything.
+			name: "later comment by a non-author human",
+			pr: PullRequestDetail{Author: "author", ReviewDecision: reviewChangesRequested,
+				Conversation: []CommentEvent{cr(base, meLogin), at(base.Add(time.Hour), "thirdparty")}},
+			want: true,
+		},
+		{
+			name: "later comment by a bot",
+			pr: PullRequestDetail{Author: "author", ReviewDecision: reviewChangesRequested,
+				Conversation: []CommentEvent{cr(base, meLogin), botAt(base.Add(time.Hour), "coderabbitai")}},
+			want: true,
+		},
+		{
+			name: "author comment predates the change request",
+			pr: PullRequestDetail{Author: "author", ReviewDecision: reviewChangesRequested,
+				Conversation: []CommentEvent{at(base.Add(-time.Hour), "author"), cr(base, meLogin)}},
+			want: true,
+		},
+		{
+			// Only the older of two change requests is addressed, so the newer
+			// one still stands. Also proves the newest is the one compared.
+			name: "two change requests, only the older is addressed",
+			pr: PullRequestDetail{Author: "author", ReviewDecision: reviewChangesRequested,
+				Conversation: []CommentEvent{
+					cr(base.Add(-2*time.Hour), meLogin),
+					at(base.Add(-time.Hour), "author"),
+					cr(base, meLogin),
+				}},
+			want: true,
+		},
+		{
+			// Path (i): the change request fell outside the fetched window.
+			name: "change request absent from the conversation window",
+			pr: PullRequestDetail{Author: "author", ReviewDecision: reviewChangesRequested,
+				Conversation: []CommentEvent{at(base, "thirdparty")}},
+			want: true,
+		},
+		{
+			// Path (ii): the only change request came from a bot reviewer.
+			name: "bot-only change request, review decision still CHANGES_REQUESTED",
+			pr: PullRequestDetail{Author: "author", ReviewDecision: reviewChangesRequested,
+				Conversation: []CommentEvent{{Login: "coderabbitai", IsBot: true, At: base, State: reviewChangesRequested}}},
+			want: true,
+		},
+		{
+			name: "zero LastCommitAt falls through to the author-reply check",
+			pr: PullRequestDetail{Author: "author", ReviewDecision: reviewChangesRequested,
+				Conversation: []CommentEvent{cr(base, meLogin)}, LastCommitAt: time.Time{}},
+			want: true,
+		},
+		{
+			// Reviewer-generic: the change request is dakshhhhh16's, not
+			// matthyx's, and must fire identically. Exhibit kubescape#2608.
+			name: "change request by a non-matthyx human reviewer",
+			pr: PullRequestDetail{Author: "author", ReviewDecision: reviewChangesRequested,
+				Conversation: []CommentEvent{cr(base, "dakshhhhh16"), at(base.Add(time.Hour), "thirdparty")}},
+			want: true,
+		},
+		{
+			// A18, pinned as documented current behaviour: the tip commit counts
+			// as an author action even when the committer is someone else - live
+			// exhibit kubescape/node-agent#808, where the reviewer pushed. A
+			// future commit-authorship filter must consciously flip this row.
+			name: "later commit whose committer is not the PR author still reads as addressed",
+			pr: PullRequestDetail{Author: "entlein", ReviewDecision: reviewChangesRequested,
+				Conversation: []CommentEvent{cr(base, meLogin)}, LastCommitAt: base.Add(720 * time.Hour)},
+			want: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := changesRequestedOutstanding(tc.pr); got != tc.want {
+				t.Errorf("changesRequestedOutstanding() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRouteTarget(t *testing.T) {
+	base := signalBase
+	// needsReviewerConv classifies as "Needs Reviewer": me spoke, someone else
+	// spoke last. waitingConv classifies as "Waiting on Author": me spoke last.
+	needsReviewerConv := []CommentEvent{at(base.Add(-2*time.Hour), meLogin), at(base.Add(-time.Hour), "author")}
+	waitingConv := []CommentEvent{at(base.Add(-2*time.Hour), "author"), at(base.Add(-time.Hour), meLogin)}
+	// noneConv never mentions me, so classifyReviewStatus returns "".
+	noneConv := []CommentEvent{at(base.Add(-2*time.Hour), "author"), at(base.Add(-time.Hour), "thirdparty")}
+	// crConv classifies as "Needs Reviewer" AND carries an outstanding change
+	// request: me spoke, submitted the change request at base, and a third party
+	// (not the PR author, so D2 cannot fire) spoke last. The change request must
+	// not be the final event, or me would be the last speaker and the classifier
+	// would say "Waiting on Author" instead.
+	crConv := []CommentEvent{
+		at(base.Add(-2*time.Hour), meLogin),
+		cr(base, meLogin),
+		at(base.Add(time.Hour), "thirdparty"),
+	}
+	// crNoneConv carries the same outstanding change request but from a reviewer
+	// who is not me, and me never appears - so the classifier returns "" and P1
+	// must gate before the change-request override can fire.
+	crNoneConv := []CommentEvent{
+		at(base.Add(-2*time.Hour), "author"),
+		cr(base, "reviewer"),
+		at(base.Add(time.Hour), "thirdparty"),
+	}
+
+	tests := []struct {
+		name       string
+		pr         PullRequestDetail
+		wantTarget string
+		wantReason string
+	}{
+		{
+			name:       "no classifier verdict plus conflict stays inert",
+			pr:         PullRequestDetail{Author: "author", Conversation: noneConv, Mergeable: mergeableConflicting},
+			wantTarget: "", wantReason: "",
+		},
+		{
+			name: "no classifier verdict plus outstanding change request stays inert",
+			pr: PullRequestDetail{Author: "author", Conversation: crNoneConv,
+				ReviewDecision: reviewChangesRequested},
+			wantTarget: "", wantReason: "",
+		},
+		{
+			name:       "needs reviewer overridden by merge conflict",
+			pr:         PullRequestDetail{Author: "author", Conversation: needsReviewerConv, Mergeable: mergeableConflicting},
+			wantTarget: statusWaitingOnAuthor, wantReason: reasonMergeConflict,
+		},
+		{
+			name: "needs reviewer overridden by outstanding change request",
+			pr: PullRequestDetail{Author: "author", Conversation: crConv,
+				ReviewDecision: reviewChangesRequested},
+			wantTarget: statusWaitingOnAuthor, wantReason: reasonChangesRequested,
+		},
+		{
+			name: "conflict outranks change request",
+			pr: PullRequestDetail{Author: "author", Conversation: crConv,
+				ReviewDecision: reviewChangesRequested, Mergeable: mergeableConflicting},
+			wantTarget: statusWaitingOnAuthor, wantReason: reasonMergeConflict,
+		},
+		{
+			name:       "unknown mergeable is no signal",
+			pr:         PullRequestDetail{Author: "author", Conversation: needsReviewerConv, Mergeable: "UNKNOWN"},
+			wantTarget: statusNeedsReviewer, wantReason: reasonLastCommenter,
+		},
+		{
+			name:       "empty mergeable is no signal",
+			pr:         PullRequestDetail{Author: "author", Conversation: needsReviewerConv},
+			wantTarget: statusNeedsReviewer, wantReason: reasonLastCommenter,
+		},
+		{
+			name: "change request addressed by a commit",
+			pr: PullRequestDetail{Author: "author", Conversation: crConv,
+				ReviewDecision: reviewChangesRequested, LastCommitAt: base.Add(2 * time.Hour)},
+			wantTarget: statusNeedsReviewer, wantReason: reasonLastCommenter,
+		},
+		{
+			// Same column as the classifier would give, different reason: the
+			// reason is load-bearing information, not decoration.
+			name:       "waiting on author with a merge conflict reports the conflict",
+			pr:         PullRequestDetail{Author: "author", Conversation: waitingConv, Mergeable: mergeableConflicting},
+			wantTarget: statusWaitingOnAuthor, wantReason: reasonMergeConflict,
+		},
+		{
+			name:       "waiting on author with no signals",
+			pr:         PullRequestDetail{Author: "author", Conversation: waitingConv},
+			wantTarget: statusWaitingOnAuthor, wantReason: reasonLastCommenter,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			target, reason := routeTarget(tc.pr, meLogin)
+			if target != tc.wantTarget || reason != tc.wantReason {
+				t.Errorf("routeTarget() = (%q, %q), want (%q, %q)", target, reason, tc.wantTarget, tc.wantReason)
+			}
+		})
+	}
+}
+
+// TestRouteTargetMonotonicity walks the full 6x4x4x3 = 288-case cross-product of
+// conversation shape, ReviewDecision, Mergeable and LastCommitAt, and asserts
+// that routeTarget can only ever withhold a move or redirect one toward
+// "Waiting on Author".
+//
+// Read a green run correctly: the property is TRUE BY CONSTRUCTION today. P1
+// short-circuits on an empty classifier verdict before any override can fire, so
+// passing proves the code matches the design - it does not prove the design was
+// discovered to be correct, and it is not evidence that monotonicity is a subtle
+// emergent fact. The test's real value is as a regression guard against future
+// edits to routeTarget: the moment someone adds a signal above P1, or an
+// override that can return "Needs Reviewer", this fails loudly instead of the
+// change reaching the board.
+func TestRouteTargetMonotonicity(t *testing.T) {
+	base := signalBase
+	before := base.Add(-time.Hour)
+	after := base.Add(time.Hour)
+
+	// Every shape is built off the same base so before/after is exact. Where a
+	// CHANGES_REQUESTED review is present it sits exactly at base.
+	conversations := map[string][]CommentEvent{
+		"empty":                 {},
+		"bot-only":              {botAt(before, "coderabbitai"), botAt(after, "dependabot")},
+		"me-last":               {at(before, "author"), cr(base, meLogin)},
+		"other-last-me-present": {at(before, meLogin), cr(base, "reviewer"), at(after, "thirdparty")},
+		"other-last-me-absent":  {cr(base, "reviewer"), at(after, "thirdparty")},
+		"author-last":           {at(before, meLogin), cr(base, "reviewer"), at(after, "author")},
+	}
+	convNames := []string{"empty", "bot-only", "me-last", "other-last-me-present", "other-last-me-absent", "author-last"}
+	decisions := []string{"", "APPROVED", "CHANGES_REQUESTED", "REVIEW_REQUIRED"}
+	mergeables := []string{"", "MERGEABLE", "CONFLICTING", "UNKNOWN"}
+	commitTimes := map[string]time.Time{"zero": {}, "before-CR": before, "after-CR": after}
+	commitNames := []string{"zero", "before-CR", "after-CR"}
+
+	cases := 0
+	for _, cn := range convNames {
+		for _, decision := range decisions {
+			for _, mergeable := range mergeables {
+				for _, tn := range commitNames {
+					cases++
+					pr := PullRequestDetail{
+						Author:         "author",
+						Conversation:   conversations[cn],
+						ReviewDecision: decision,
+						Mergeable:      mergeable,
+						LastCommitAt:   commitTimes[tn],
+					}
+					got, reason := routeTarget(pr, meLogin)
+					want := classifyReviewStatus(pr.Conversation, meLogin)
+					desc := fmt.Sprintf("conv=%s decision=%q mergeable=%q commit=%s", cn, decision, mergeable, tn)
+
+					// 2. No candidate is created.
+					if got != "" && want == "" {
+						t.Errorf("%s: routeTarget created a candidate %q the classifier did not", desc, got)
+					}
+					// 3. No new "Needs Reviewer".
+					if got == statusNeedsReviewer && want != statusNeedsReviewer {
+						t.Errorf("%s: routeTarget produced %q but the classifier said %q", desc, got, want)
+					}
+					// 4. The only permitted redirection is toward "Waiting on Author".
+					if got != "" && got != want && got != statusWaitingOnAuthor {
+						t.Errorf("%s: routeTarget redirected %q -> %q, which is not toward %q", desc, want, got, statusWaitingOnAuthor)
+					}
+					// 5. The reason is one of the three consts, and is "" exactly
+					// when the target is "".
+					switch reason {
+					case reasonMergeConflict, reasonChangesRequested, reasonLastCommenter:
+						if got == "" {
+							t.Errorf("%s: empty target carried reason %q", desc, reason)
+						}
+					case "":
+						if got != "" {
+							t.Errorf("%s: target %q carried an empty reason", desc, got)
+						}
+					default:
+						t.Errorf("%s: unknown reason %q", desc, reason)
+					}
+				}
+			}
+		}
+	}
+	if cases != 288 {
+		t.Errorf("expected 288 enumerated cases, walked %d", cases)
+	}
+}
+
+// signalExtras is the pr/11..pr/19 fixture table exercising the new signals.
+func signalExtras(f *routingFixture) {
+	base := signalBase
+	f.extraPRs = []PullRequestDetail{
+		// Conflict pins a "Needs Reviewer" verdict to "Waiting on Author".
+		{URL: prURL(11), Author: "author", Mergeable: mergeableConflicting,
+			Conversation: []CommentEvent{at(base, meLogin), at(base.Add(time.Hour), "author")}},
+		// A11: UNKNOWN is no signal, so plain last-commenter routing applies.
+		{URL: prURL(12), Author: "author", Mergeable: "UNKNOWN",
+			Conversation: []CommentEvent{at(base, meLogin), at(base.Add(time.Hour), "author")}},
+		// The reported G2 gap: a third party spoke after the change request.
+		{URL: prURL(13), Author: "author", ReviewDecision: reviewChangesRequested,
+			Conversation: []CommentEvent{cr(base, meLogin), at(base.Add(time.Hour), "thirdparty")}},
+		// D2: the author replied, so the change request is addressed.
+		{URL: prURL(14), Author: "author", ReviewDecision: reviewChangesRequested,
+			Conversation: []CommentEvent{cr(base, meLogin), at(base.Add(time.Hour), "author")}},
+		// D1: a newer commit addresses the change request.
+		{URL: prURL(15), Author: "author", ReviewDecision: reviewChangesRequested,
+			LastCommitAt: base.Add(2 * time.Hour),
+			Conversation: []CommentEvent{cr(base, meLogin), at(base.Add(time.Hour), "thirdparty")}},
+		// Monotonicity: matthyx never spoke, so no signal may create a candidate.
+		{URL: prURL(16), Author: "author", Mergeable: mergeableConflicting,
+			ReviewDecision: reviewChangesRequested, Conversation: []CommentEvent{}},
+		// Stale approved label: reported, never mutated.
+		{URL: prURL(17), Author: "author", ReviewDecision: reviewApproved,
+			Conversation: []CommentEvent{at(base, meLogin), at(base.Add(time.Hour), "author")}},
+		// Already in the decided column: no mutation, but a keeping line and a
+		// by-conflict increment. This is the row that pins the counter/line 1:1
+		// invariant - without it the correspondence is vacuously satisfied.
+		{URL: prURL(18), Author: "author", Mergeable: mergeableConflicting,
+			Conversation: []CommentEvent{at(base, meLogin), at(base.Add(time.Hour), "author")}},
+		// Reviewer-generic: the change request is dakshhhhh16's. The leading
+		// meLogin event exists only to open the P1 gate (the classifier needs me
+		// to have participated); it changes nothing about which reviewer's change
+		// request newestChangeRequestAt finds.
+		{URL: prURL(19), Author: "author", ReviewDecision: reviewChangesRequested,
+			Conversation: []CommentEvent{
+				at(base.Add(-time.Hour), meLogin),
+				cr(base, "dakshhhhh16"),
+				at(base.Add(time.Hour), "thirdparty"),
+			}},
+	}
+	f.extraItems = []ProjectItem{
+		{ID: "pr-11", URL: prURL(11)},
+		{ID: "pr-12", URL: prURL(12)},
+		{ID: "pr-13", URL: prURL(13)},
+		{ID: "pr-14", URL: prURL(14)},
+		{ID: "pr-15", URL: prURL(15)},
+		{ID: "pr-16", URL: prURL(16)},
+		{ID: "pr-17", URL: prURL(17), StatusName: statusNeedsReviewer},
+		{ID: "pr-18", URL: prURL(18), StatusName: statusWaitingOnAuthor},
+		{ID: "pr-19", URL: prURL(19)},
+	}
+}
+
+func TestRunRoutesPRsBySignals(t *testing.T) {
+	ctx := t.Context()
+	f := newRoutingFixture()
+	signalExtras(f)
+
+	out := captureOutput(t, func() { Run(ctx, f.client()) })
+
+	proj := "project-" + prTrackingBoard
+	want := []fieldUpdate{
+		// Base fixture, unchanged.
+		{proj, "pr-1", "field-123", "option-waiting"},
+		{proj, "pr-2", "field-123", "option-needs"},
+		{proj, "pr-4", "field-123", "option-archive"},
+		{proj, "pr-10", "field-123", "option-waiting"},
+		// The six extras that produce a move.
+		{proj, "pr-11", "field-123", "option-waiting"},
+		{proj, "pr-12", "field-123", "option-needs"},
+		{proj, "pr-13", "field-123", "option-waiting"},
+		{proj, "pr-14", "field-123", "option-needs"},
+		{proj, "pr-15", "field-123", "option-needs"},
+		{proj, "pr-19", "field-123", "option-waiting"},
+	}
+	got := f.recorded()
+	if len(got) != len(want) {
+		t.Fatalf("expected %d mutations, got %d: %+v", len(want), len(got), got)
+	}
+	for _, w := range want {
+		if !slices.Contains(got, w) {
+			t.Errorf("missing expected mutation %+v, got %+v", w, got)
+		}
+	}
+	// pr/16, pr/17 and pr/18 must never be written to.
+	for _, id := range []string{"pr-16", "pr-17", "pr-18"} {
+		for _, u := range got {
+			if u.itemID == id {
+				t.Errorf("%s must produce no mutation, got %+v", id, u)
+			}
+		}
+	}
+
+	wantLines := []string{
+		`moved pr ` + prURL(11) + ` from "(none)" to "Waiting on Author" (merge-conflict)`,
+		`moved pr ` + prURL(12) + ` from "(none)" to "Needs Reviewer" (last-commenter)`,
+		`moved pr ` + prURL(13) + ` from "(none)" to "Waiting on Author" (changes-requested)`,
+		`moved pr ` + prURL(19) + ` from "(none)" to "Waiting on Author" (changes-requested)`,
+		`keeping pr ` + prURL(18) + ` in "Waiting on Author" (merge-conflict)`,
+		`approved pr ` + prURL(17) + ` still in "Needs Reviewer"`,
+		"stale-approved: 1 approved pr(s) still in a managed column",
+		"2 by-conflict",
+		"2 by-changes-requested",
+	}
+	for _, w := range wantLines {
+		if !strings.Contains(out, w) {
+			t.Errorf("expected output to contain %q, got:\n%s", w, out)
+		}
+	}
+	// The keeping line is printed exactly once, and never for last-commenter.
+	if n := strings.Count(out, "keeping pr "); n != 1 {
+		t.Errorf("expected exactly 1 keeping line, got %d:\n%s", n, out)
+	}
+	// pr/3 is already in target with reason last-commenter, so it must stay
+	// silent: the keeping line is scoped to the two new signals only.
+	if strings.Contains(out, "keeping pr "+prURL(3)) {
+		t.Errorf("keeping must not print for last-commenter decisions, got:\n%s", out)
+	}
+	// pr/16 produces no routing decision at all: no move, no keeping line, no
+	// stale-approved line. (It still appears in the console report section,
+	// which lists every PR and is not part of the routing output.)
+	for _, prefix := range []string{"moved pr ", "would move pr ", "keeping pr ", "approved pr "} {
+		if strings.Contains(out, prefix+prURL(16)) {
+			t.Errorf("pr/16 must produce no %q line, got:\n%s", prefix, out)
+		}
+	}
+	// The counter invariant: each by-* count equals its moved + keeping lines.
+	conflictLines := strings.Count(out, "(merge-conflict)")
+	crLines := strings.Count(out, "(changes-requested)")
+	if conflictLines != 2 {
+		t.Errorf("expected 2 lines carrying (merge-conflict) to match by-conflict: 2, got %d:\n%s", conflictLines, out)
+	}
+	if crLines != 2 {
+		t.Errorf("expected 2 lines carrying (changes-requested) to match by-changes-requested: 2, got %d:\n%s", crLines, out)
+	}
+	// pr/3 and pr/18 are both already in target.
+	if !strings.Contains(out, "2 already-in-target") {
+		t.Errorf("expected 2 already-in-target in summary, got:\n%s", out)
+	}
+}
+
+func TestRunReportsStaleApproved(t *testing.T) {
+	t.Run("reports and never mutates", func(t *testing.T) {
+		f := newRoutingFixture()
+		signalExtras(f)
+
+		out := captureOutput(t, func() { Run(t.Context(), f.client()) })
+
+		if !strings.Contains(out, `approved pr `+prURL(17)+` still in "Needs Reviewer" (routing does not manage approved PRs)`) {
+			t.Errorf("expected a stale-approved line for pr/17, got:\n%s", out)
+		}
+		if !strings.Contains(out, "stale-approved: 1 approved pr(s) still in a managed column") {
+			t.Errorf("expected a stale-approved count, got:\n%s", out)
+		}
+		for _, u := range f.recorded() {
+			if u.itemID == "pr-17" {
+				t.Errorf("the stale-approved scan must issue zero mutations, got %+v", u)
+			}
+		}
+	})
+
+	t.Run("survives a misconfigured board", func(t *testing.T) {
+		// The whole point of de-nesting the scan from the routing precondition:
+		// a board that disables routing must not also hide this report.
+		f := newRoutingFixture()
+		signalExtras(f)
+		f.optionsErr = errors.New("boom")
+
+		out := captureOutput(t, func() { Run(t.Context(), f.client()) })
+
+		if !strings.Contains(out, "routing disabled: boom") {
+			t.Errorf("expected routing to be disabled, got:\n%s", out)
+		}
+		if !strings.Contains(out, `approved pr `+prURL(17)+` still in "Needs Reviewer"`) {
+			t.Errorf("expected the stale-approved line even with routing disabled, got:\n%s", out)
+		}
+		if !strings.Contains(out, "stale-approved: 1") {
+			t.Errorf("expected the stale-approved count even with routing disabled, got:\n%s", out)
+		}
+		if routed := f.routingUpdates(); len(routed) != 0 {
+			t.Errorf("expected zero routing mutations, got %+v", routed)
+		}
+	})
 }
