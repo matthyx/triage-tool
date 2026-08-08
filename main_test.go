@@ -16,6 +16,13 @@ import (
 	mapset "github.com/deckarep/golang-set/v2"
 )
 
+func init() {
+	createMulticaIssue = func(ctx context.Context, repoName, prNumber, fullURL string) error {
+		return nil
+	}
+}
+
+
 type MockGHClient struct {
 	AddProjectItemFunc           func(ctx context.Context, owner, board, url string) error
 	GetProjectIDFunc             func(ctx context.Context, owner, board string) (string, error)
@@ -1141,3 +1148,82 @@ func TestRunReportsStaleApproved(t *testing.T) {
 		}
 	})
 }
+
+func TestParsePRRepoAndNumber(t *testing.T) {
+	tests := []struct {
+		url      string
+		wantRepo string
+		wantNum  string
+		wantOK   bool
+	}{
+		{
+			url:      "https://github.com/kubescape/node-agent/pull/808",
+			wantRepo: "node-agent",
+			wantNum:  "808",
+			wantOK:   true,
+		},
+		{
+			url:      "https://github.com/matthyx/triage-tool/pull/42",
+			wantRepo: "triage-tool",
+			wantNum:  "42",
+			wantOK:   true,
+		},
+		{
+			url:      "https://github.com/kubescape/node-agent/issues/808",
+			wantRepo: "",
+			wantNum:  "",
+			wantOK:   false,
+		},
+		{
+			url:      "invalid-url",
+			wantRepo: "",
+			wantNum:  "",
+			wantOK:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		repo, num, ok := parsePRRepoAndNumber(tt.url)
+		if repo != tt.wantRepo || num != tt.wantNum || ok != tt.wantOK {
+			t.Errorf("parsePRRepoAndNumber(%q) = (%q, %q, %v); want (%q, %q, %v)",
+				tt.url, repo, num, ok, tt.wantRepo, tt.wantNum, tt.wantOK)
+		}
+	}
+}
+
+func TestMulticaIssueInvocation(t *testing.T) {
+	var calledWith []string
+	orig := createMulticaIssue
+	defer func() { createMulticaIssue = orig }()
+
+	createMulticaIssue = func(ctx context.Context, repoName, prNumber, fullURL string) error {
+		title := fmt.Sprintf("%s %s", repoName, prNumber)
+		description := fmt.Sprintf("review %s add PR comments on blockers, when it's good to merge approve", fullURL)
+		calledWith = []string{repoName, prNumber, fullURL, title, description}
+		return nil
+	}
+
+	url := "https://github.com/kubescape/node-agent/pull/808"
+	repo, num, ok := parsePRRepoAndNumber(url)
+	if !ok {
+		t.Fatalf("failed to parse url")
+	}
+	err := createMulticaIssue(t.Context(), repo, num, url)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(calledWith) != 5 {
+		t.Fatalf("expected 5 elements in calledWith, got %d", len(calledWith))
+	}
+
+	if calledWith[3] != "node-agent 808" {
+		t.Errorf("expected title 'node-agent 808', got %q", calledWith[3])
+	}
+
+	expectedDesc := "review https://github.com/kubescape/node-agent/pull/808 add PR comments on blockers, when it's good to merge approve"
+	if calledWith[4] != expectedDesc {
+		t.Errorf("expected description %q, got %q", expectedDesc, calledWith[4])
+	}
+}
+

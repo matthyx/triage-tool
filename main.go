@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"runtime"
 	"slices"
 	"strconv"
@@ -1081,6 +1082,13 @@ func Run(ctx context.Context, client GHClient) {
 					fmt.Println("error adding pr", url, err)
 				} else {
 					fmt.Println("added pr", url)
+					if repoName, prNumber, ok := parsePRRepoAndNumber(url); ok {
+						if err := createMulticaIssue(ctx, repoName, prNumber, url); err != nil {
+							fmt.Printf("error creating multica issue for pr %s: %v\n", url, err)
+						} else {
+							fmt.Printf("created multica issue for pr %s\n", url)
+						}
+					}
 				}
 			})
 		}
@@ -1338,4 +1346,34 @@ func Run(ctx context.Context, client GHClient) {
 		fmt.Println("\n🎉 All PRs are in a great state! No pull requests currently need attention.")
 	}
 	fmt.Println("========================================================================")
+}
+
+func parsePRRepoAndNumber(urlStr string) (repo string, number string, ok bool) {
+	parsedURL, err := url.Parse(urlStr)
+	if err != nil {
+		return "", "", false
+	}
+	parts := strings.Split(parsedURL.Path, "/")
+	if len(parts) < 5 || parts[3] != "pull" {
+		return "", "", false
+	}
+	return parts[2], parts[4], true
+}
+
+var createMulticaIssue = defaultCreateMulticaIssue
+
+func defaultCreateMulticaIssue(ctx context.Context, repoName, prNumber, fullURL string) error {
+	title := fmt.Sprintf("%s %s", repoName, prNumber)
+	description := fmt.Sprintf("review %s add PR comments on blockers, when it's good to merge approve", fullURL)
+
+	cmd := exec.CommandContext(ctx, "multica", "issue", "create",
+		"--assignee", "Antigravity",
+		"--title", title,
+		"--description", description,
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("multica execution failed: %w (output: %s)", err, strings.TrimSpace(string(output)))
+	}
+	return nil
 }
