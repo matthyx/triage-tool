@@ -285,13 +285,14 @@ func TestResolveStatusName(t *testing.T) {
 	}
 }
 
-// statusOptions is the well-formed board shape: all three routing options on one
+// statusOptions is the well-formed board shape: all four routing options on one
 // single-select field literally named "Status", so Step 5a's preconditions pass.
 func statusOptions() map[string]FieldOption {
 	return map[string]FieldOption{
 		statusToArchive:       {FieldID: "field-123", OptionID: "option-archive", FieldName: statusFieldName},
 		statusWaitingOnAuthor: {FieldID: "field-123", OptionID: "option-waiting", FieldName: statusFieldName},
 		statusNeedsReviewer:   {FieldID: "field-123", OptionID: "option-needs", FieldName: statusFieldName},
+		statusWIP:             {FieldID: "field-123", OptionID: "option-wip", FieldName: statusFieldName},
 	}
 }
 
@@ -550,6 +551,9 @@ func TestRunRoutesPRsByLastCommenter(t *testing.T) {
 		{"project-" + prTrackingBoard, "pr-1", "field-123", "option-waiting"},
 		{"project-" + prTrackingBoard, "pr-2", "field-123", "option-needs"},
 		{"project-" + prTrackingBoard, "pr-4", "field-123", "option-archive"},
+		{"project-" + prTrackingBoard, "pr-7", "field-123", "option-waiting"},
+		{"project-" + prTrackingBoard, "pr-8", "field-123", "option-waiting"},
+		{"project-" + prTrackingBoard, "pr-9", "field-123", "option-wip"},
 		{"project-" + prTrackingBoard, "pr-10", "field-123", "option-waiting"},
 	}
 	got := f.recorded()
@@ -611,6 +615,13 @@ func TestRunRoutingDisabledOnMisconfiguredBoard(t *testing.T) {
 			name: "missing Needs Reviewer option",
 			mutate: func(f *routingFixture) {
 				delete(f.options, statusNeedsReviewer)
+			},
+			wantLog: "routing disabled: board is missing",
+		},
+		{
+			name: "missing WIP option",
+			mutate: func(f *routingFixture) {
+				delete(f.options, statusWIP)
 			},
 			wantLog: "routing disabled: board is missing",
 		},
@@ -864,6 +875,27 @@ func TestRouteTarget(t *testing.T) {
 			pr:         PullRequestDetail{Author: "author", Conversation: waitingConv},
 			wantTarget: statusWaitingOnAuthor, wantReason: reasonLastCommenter,
 		},
+		{
+			name: "own PR is unconditionally routed to WIP",
+			pr: PullRequestDetail{Author: meLogin, Conversation: needsReviewerConv,
+				ReviewDecision: reviewChangesRequested, Mergeable: mergeableConflicting},
+			wantTarget: statusWIP, wantReason: reasonOwnPR,
+		},
+		{
+			name:       "own PR with no conversation is unconditionally routed to WIP",
+			pr:         PullRequestDetail{Author: meLogin},
+			wantTarget: statusWIP, wantReason: reasonOwnPR,
+		},
+		{
+			name:       "draft PR is routed by last-commenter",
+			pr:         PullRequestDetail{Author: "author", IsDraft: true, Conversation: waitingConv},
+			wantTarget: statusWaitingOnAuthor, wantReason: reasonLastCommenter,
+		},
+		{
+			name:       "approved PR is routed by last-commenter",
+			pr:         PullRequestDetail{Author: "author", ReviewDecision: reviewApproved, Conversation: needsReviewerConv},
+			wantTarget: statusNeedsReviewer, wantReason: reasonLastCommenter,
+		},
 	}
 
 	for _, tc := range tests {
@@ -1026,10 +1058,13 @@ func TestRunRoutesPRsBySignals(t *testing.T) {
 
 	proj := "project-" + prTrackingBoard
 	want := []fieldUpdate{
-		// Base fixture, unchanged.
+		// Base fixture.
 		{proj, "pr-1", "field-123", "option-waiting"},
 		{proj, "pr-2", "field-123", "option-needs"},
 		{proj, "pr-4", "field-123", "option-archive"},
+		{proj, "pr-7", "field-123", "option-waiting"},
+		{proj, "pr-8", "field-123", "option-waiting"},
+		{proj, "pr-9", "field-123", "option-wip"},
 		{proj, "pr-10", "field-123", "option-waiting"},
 		// The six extras that produce a move.
 		{proj, "pr-11", "field-123", "option-waiting"},
@@ -1063,8 +1098,6 @@ func TestRunRoutesPRsBySignals(t *testing.T) {
 		`moved pr ` + prURL(13) + ` from "(none)" to "Waiting on Author" (changes-requested)`,
 		`moved pr ` + prURL(19) + ` from "(none)" to "Waiting on Author" (changes-requested)`,
 		`keeping pr ` + prURL(18) + ` in "Waiting on Author" (merge-conflict)`,
-		`approved pr ` + prURL(17) + ` still in "Needs Reviewer"`,
-		"stale-approved: 1 approved pr(s) still in a managed column",
 		"2 by-conflict",
 		"2 by-changes-requested",
 	}
@@ -1082,10 +1115,10 @@ func TestRunRoutesPRsBySignals(t *testing.T) {
 	if strings.Contains(out, "keeping pr "+prURL(3)) {
 		t.Errorf("keeping must not print for last-commenter decisions, got:\n%s", out)
 	}
-	// pr/16 produces no routing decision at all: no move, no keeping line, no
-	// stale-approved line. (It still appears in the console report section,
-	// which lists every PR and is not part of the routing output.)
-	for _, prefix := range []string{"moved pr ", "would move pr ", "keeping pr ", "approved pr "} {
+	// pr/16 produces no routing decision at all: no move, no keeping line.
+	// (It still appears in the console report section, which lists every PR
+	// and is not part of the routing output.)
+	for _, prefix := range []string{"moved pr ", "would move pr ", "keeping pr "} {
 		if strings.Contains(out, prefix+prURL(16)) {
 			t.Errorf("pr/16 must produce no %q line, got:\n%s", prefix, out)
 		}
@@ -1099,54 +1132,43 @@ func TestRunRoutesPRsBySignals(t *testing.T) {
 	if crLines != 2 {
 		t.Errorf("expected 2 lines carrying (changes-requested) to match by-changes-requested: 2, got %d:\n%s", crLines, out)
 	}
-	// pr/3 and pr/18 are both already in target.
-	if !strings.Contains(out, "2 already-in-target") {
-		t.Errorf("expected 2 already-in-target in summary, got:\n%s", out)
+	// pr/3, pr/17 and pr/18 are all already in target.
+	if !strings.Contains(out, "3 already-in-target") {
+		t.Errorf("expected 3 already-in-target in summary, got:\n%s", out)
 	}
 }
 
-func TestRunReportsStaleApproved(t *testing.T) {
-	t.Run("reports and never mutates", func(t *testing.T) {
-		f := newRoutingFixture()
-		signalExtras(f)
+func TestRunRoutesApprovedAndDraftAndOwnPRs(t *testing.T) {
+	ctx := t.Context()
+	f := newRoutingFixture()
 
-		out := captureOutput(t, func() { Run(t.Context(), f.client()) })
+	out := captureOutput(t, func() { Run(ctx, f.client()) })
 
-		if !strings.Contains(out, `approved pr `+prURL(17)+` still in "Needs Reviewer" (routing does not manage approved PRs)`) {
-			t.Errorf("expected a stale-approved line for pr/17, got:\n%s", out)
+	proj := "project-" + prTrackingBoard
+	// pr-7 (APPROVED) is routed to Waiting on Author
+	// pr-8 (Draft) is routed to Waiting on Author
+	// pr-9 (Author: matthyx) is routed to WIP
+	want := []fieldUpdate{
+		{proj, "pr-7", "field-123", "option-waiting"},
+		{proj, "pr-8", "field-123", "option-waiting"},
+		{proj, "pr-9", "field-123", "option-wip"},
+	}
+	got := f.recorded()
+	for _, w := range want {
+		if !slices.Contains(got, w) {
+			t.Errorf("missing expected mutation %+v, got %+v", w, got)
 		}
-		if !strings.Contains(out, "stale-approved: 1 approved pr(s) still in a managed column") {
-			t.Errorf("expected a stale-approved count, got:\n%s", out)
-		}
-		for _, u := range f.recorded() {
-			if u.itemID == "pr-17" {
-				t.Errorf("the stale-approved scan must issue zero mutations, got %+v", u)
-			}
-		}
-	})
+	}
 
-	t.Run("survives a misconfigured board", func(t *testing.T) {
-		// The whole point of de-nesting the scan from the routing precondition:
-		// a board that disables routing must not also hide this report.
-		f := newRoutingFixture()
-		signalExtras(f)
-		f.optionsErr = errors.New("boom")
-
-		out := captureOutput(t, func() { Run(t.Context(), f.client()) })
-
-		if !strings.Contains(out, "routing disabled: boom") {
-			t.Errorf("expected routing to be disabled, got:\n%s", out)
-		}
-		if !strings.Contains(out, `approved pr `+prURL(17)+` still in "Needs Reviewer"`) {
-			t.Errorf("expected the stale-approved line even with routing disabled, got:\n%s", out)
-		}
-		if !strings.Contains(out, "stale-approved: 1") {
-			t.Errorf("expected the stale-approved count even with routing disabled, got:\n%s", out)
-		}
-		if routed := f.routingUpdates(); len(routed) != 0 {
-			t.Errorf("expected zero routing mutations, got %+v", routed)
-		}
-	})
+	if !strings.Contains(out, `moved pr `+prURL(7)+` from "(none)" to "Waiting on Author" (last-commenter)`) {
+		t.Errorf("expected pr/7 (approved) to be routed, got:\n%s", out)
+	}
+	if !strings.Contains(out, `moved pr `+prURL(8)+` from "(none)" to "Waiting on Author" (last-commenter)`) {
+		t.Errorf("expected pr/8 (draft) to be routed, got:\n%s", out)
+	}
+	if !strings.Contains(out, `moved pr `+prURL(9)+` from "(none)" to "WIP" (own-pr)`) {
+		t.Errorf("expected pr/9 (own pr) to be routed to WIP, got:\n%s", out)
+	}
 }
 
 func TestParsePRRepoAndNumber(t *testing.T) {

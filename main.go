@@ -30,6 +30,7 @@ const (
 	statusToArchive       = "To Archive"
 	statusWaitingOnAuthor = "Waiting on Author"
 	statusNeedsReviewer   = "Needs Reviewer"
+	statusWIP             = "WIP"
 	commentHistoryLimit   = 30
 
 	// mergeableConflicting is the one MergeableState that means the author must
@@ -37,8 +38,7 @@ const (
 	mergeableConflicting = "CONFLICTING"
 	// reviewChangesRequested is both a Review.state and a reviewDecision value.
 	reviewChangesRequested = "CHANGES_REQUESTED"
-	// reviewApproved is used by the stale-approved report only; the routing
-	// loop's own "APPROVED" literal is protected and stays as-is.
+	// reviewApproved is a reviewDecision value.
 	reviewApproved = "APPROVED"
 
 	// reason* are the routing reasons routeTarget can return. They exist so the
@@ -46,19 +46,13 @@ const (
 	reasonMergeConflict    = "merge-conflict"
 	reasonChangesRequested = "changes-requested"
 	reasonLastCommenter    = "last-commenter"
+	reasonOwnPR            = "own-pr"
 )
 
 // routableStatuses are the only current statuses the routing rule may overwrite.
 // "To Archive" is deliberately absent: a human can park an open PR there to mean
 // "stop showing me this", and routing must not yank it back out.
-var routableStatuses = []string{"", statusWaitingOnAuthor, statusNeedsReviewer}
-
-// staleApprovedStatuses are the columns where an APPROVED open PR indicates a
-// stale label. Deliberately NOT routableStatuses: that set is under discussion
-// (re-adding "To Archive" is an open follow-up), and a human who parks an
-// approved PR in "To Archive" has curated it, not left it stale. "" is absent
-// for the same reason - a blank status is not a stale label.
-var staleApprovedStatuses = []string{statusWaitingOnAuthor, statusNeedsReviewer}
+var routableStatuses = []string{"", statusWaitingOnAuthor, statusNeedsReviewer, statusWIP}
 
 // CommentEvent is one conversation event, already stripped of GraphQL shapes.
 type CommentEvent struct {
@@ -145,7 +139,7 @@ func resolveStatusName(values []singleSelectValue) string {
 }
 
 // managedStatuses are the status names this tool knows how to set.
-var managedStatuses = []string{statusToArchive, statusWaitingOnAuthor, statusNeedsReviewer}
+var managedStatuses = []string{statusToArchive, statusWaitingOnAuthor, statusNeedsReviewer, statusWIP}
 
 type RealGHClient struct {
 	v4Client *githubv4.Client
@@ -354,14 +348,15 @@ func changesRequestedOutstanding(pr PullRequestDetail) bool {
 }
 
 // routeTarget decides the column an open PR belongs in and why, applying the
-// signal precedence: last-commenter first as a gate, then merge conflict, then
-// an outstanding change request. Both overrides can only redirect a move toward
-// "Waiting on Author"; neither can create a move the last-commenter rule did not
-// already produce. Returns ("", "") when no move applies.
-//
-// It deliberately does not re-implement the routing loop's own guards (author,
-// approved, draft, closed, unmanaged status): those stay in the loop.
+// signal precedence: own PR to WIP first, then last-commenter as a gate, then
+// merge conflict, then an outstanding change request. Both overrides can only
+// redirect a move toward "Waiting on Author"; neither can create a move the
+// last-commenter rule did not already produce. Returns ("", "") when no move
+// applies.
 func routeTarget(pr PullRequestDetail, me string) (string, string) {
+	if pr.Author == me {
+		return statusWIP, reasonOwnPR
+	}
 	// P0: the frozen last-commenter rule.
 	target := classifyReviewStatus(pr.Conversation, me)
 	// P1: MONOTONICITY GATE. No signal may create a routing candidate the
@@ -1149,27 +1144,6 @@ func Run(ctx context.Context, client GHClient) {
 	wg.Wait()
 
 	// Approved PRs are never routed (A8), so a column set before approval can go
-	// stale. Report them; correcting them needs a new disposition (plan fork C3).
-	// Runs regardless of the routing precondition below: it mutates nothing, and
-	// a misconfigured board must not suppress a zero-risk visibility feature.
-	staleApproved := 0
-	for _, item := range prItems {
-		if item.Closed || !slices.Contains(staleApprovedStatuses, item.StatusName) {
-			continue
-		}
-		pr, ok := allPRDetails[item.URL]
-		// IsDraft and Author == meLogin mirror the routing loop's own exemptions:
-		// neither is something the tool is telling matthyx to fix.
-		if !ok || pr.ReviewDecision != reviewApproved || pr.IsDraft || pr.Author == meLogin {
-			continue
-		}
-		staleApproved++
-		fmt.Printf("approved pr %s still in %q (routing does not manage approved PRs)\n", item.URL, item.StatusName)
-	}
-	if staleApproved > 0 {
-		fmt.Printf("stale-approved: %d approved pr(s) still in a managed column\n", staleApproved)
-	}
-
 	// Route open PRs between columns based on who spoke last in the conversation.
 	// Disabled loudly rather than guessed at when the board is not shaped as expected.
 	dryRun := os.Getenv("TRIAGE_ROUTING_DRY_RUN") != ""
@@ -1178,13 +1152,14 @@ func Run(ctx context.Context, client GHClient) {
 	wa, okWA := prOptions[statusWaitingOnAuthor]
 	nr, okNR := prOptions[statusNeedsReviewer]
 	ta := prOptions[statusToArchive]
+	wip, okWIP := prOptions[statusWIP]
 
 	switch {
 	case err != nil:
 		fmt.Printf("routing disabled: %v\n", err)
-	case !okWA || !okNR:
-		fmt.Println(`routing disabled: board is missing "Waiting on Author" and/or "Needs Reviewer"`)
-	case wa.FieldID != nr.FieldID || wa.FieldID != ta.FieldID:
+	case !okWA || !okNR || !okWIP:
+		fmt.Println(`routing disabled: board is missing "Waiting on Author", "Needs Reviewer", and/or "WIP"`)
+	case wa.FieldID != nr.FieldID || wa.FieldID != ta.FieldID || wa.FieldID != wip.FieldID:
 		fmt.Println("routing options span multiple fields, disabling routing")
 	case wa.FieldName != statusFieldName:
 		fmt.Printf("status field is not named %q, disabling routing\n", statusFieldName)
@@ -1207,9 +1182,6 @@ func Run(ctx context.Context, client GHClient) {
 			}
 			pr, ok := allPRDetails[item.URL]
 			if !ok {
-				continue
-			}
-			if pr.Author == meLogin || pr.ReviewDecision == "APPROVED" || pr.IsDraft {
 				continue
 			}
 			target, reason := routeTarget(pr, meLogin)
@@ -1367,7 +1339,7 @@ func defaultCreateMulticaIssue(ctx context.Context, repoName, prNumber, fullURL 
 	description := fmt.Sprintf("review %s add PR comments on blockers, when it's good to merge approve", fullURL)
 
 	cmd := exec.CommandContext(ctx, "multica", "issue", "create",
-		"--assignee", "Antigravity",
+		"--assignee", "Claude",
 		"--title", title,
 		"--description", description,
 	)
