@@ -1192,9 +1192,7 @@ func Run(ctx context.Context, client GHClient) {
 			candidates++
 			// Counted here, above the disposition guards, so the counters mean
 			// "decisions produced by a new signal" - including PRs already in the
-			// right column. The keep-line below is what makes that population
-			// visible, keeping counters and printed lines 1:1. Both these
-			// increments and the keep-line run on the single-threaded loop
+			// right column. These increments run on the single-threaded loop
 			// goroutine (before routeWP.Submit), so they need no mutex; only
 			// moved is touched inside the worker closure under mu.
 			switch reason {
@@ -1205,11 +1203,6 @@ func Run(ctx context.Context, client GHClient) {
 			}
 			if item.StatusName == target {
 				alreadyInTarget++
-				// Suppressed for last-commenter: those decisions are identical to
-				// pre-signal behaviour and print nothing today.
-				if reason != reasonLastCommenter {
-					fmt.Printf("keeping pr %s in %q (%s)\n", item.URL, item.StatusName, reason)
-				}
 				continue
 			}
 			opt, ok := prOptions[target]

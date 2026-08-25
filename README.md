@@ -73,12 +73,9 @@ visible in the fetched conversation window, the PR is pinned conservatively.
 | --- | --- |
 | `moved pr <url> from "<a>" to "<b>" (<reason>)` | The board was changed. |
 | `would move pr <url> from "<a>" to "<b>" (<reason>)` | Same, under `TRIAGE_ROUTING_DRY_RUN`. |
-| `keeping pr <url> in "<status>" (<reason>)` | A signal decided this PR's column and the PR is already there — **no mutation**. Printed for non-`last-commenter` reasons (`merge-conflict`, `changes-requested`, `own-pr`); a plain `last-commenter` decision on a PR already in place stays silent. |
 
 The `by-conflict` and `by-changes-requested` counters in the routing summary count
 **decisions, not mutations**, so they include PRs already sitting in the right column.
-Each increment corresponds to exactly one printed line carrying that reason — a
-`moved`/`would move` line, or a `keeping` line.
 
 ## Environment variables
 

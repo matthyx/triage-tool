@@ -1062,9 +1062,7 @@ func signalExtras(f *routingFixture) {
 		// Stale approved label: reported, never mutated.
 		{URL: prURL(17), Author: "author", ReviewDecision: reviewApproved,
 			Conversation: []CommentEvent{at(base, "matthyx"), at(base.Add(time.Hour), "author")}},
-		// Already in the decided column: no mutation, but a keeping line and a
-		// by-conflict increment. This is the row that pins the counter/line 1:1
-		// invariant - without it the correspondence is vacuously satisfied.
+		// Already in the decided column: no mutation, but a by-conflict increment.
 		{URL: prURL(18), Author: "author", Mergeable: mergeableConflicting,
 			Conversation: []CommentEvent{at(base, "matthyx"), at(base.Add(time.Hour), "author")}},
 		// Reviewer-generic: the change request is dakshhhhh16's. The leading
@@ -1139,7 +1137,6 @@ func TestRunRoutesPRsBySignals(t *testing.T) {
 		`moved pr ` + prURL(12) + ` from "(none)" to "Needs Reviewer" (last-commenter)`,
 		`moved pr ` + prURL(13) + ` from "(none)" to "Waiting on Author" (changes-requested)`,
 		`moved pr ` + prURL(19) + ` from "(none)" to "Waiting on Author" (changes-requested)`,
-		`keeping pr ` + prURL(18) + ` in "Waiting on Author" (merge-conflict)`,
 		"2 by-conflict",
 		"2 by-changes-requested",
 	}
@@ -1148,28 +1145,22 @@ func TestRunRoutesPRsBySignals(t *testing.T) {
 			t.Errorf("expected output to contain %q, got:\n%s", w, out)
 		}
 	}
-	// The keeping line is printed exactly once, and never for last-commenter.
-	if n := strings.Count(out, "keeping pr "); n != 1 {
-		t.Errorf("expected exactly 1 keeping line, got %d:\n%s", n, out)
+	// The keeping line should never be printed.
+	if strings.Contains(out, "keeping pr ") {
+		t.Errorf("expected no keeping lines, got:\n%s", out)
 	}
-	// pr/3 is already in target with reason last-commenter, so it must stay
-	// silent: the keeping line is scoped to the two new signals only.
-	if strings.Contains(out, "keeping pr "+prURL(3)) {
-		t.Errorf("keeping must not print for last-commenter decisions, got:\n%s", out)
-	}
-	// pr/16 produces no routing decision at all: no move, no keeping line.
+	// pr/16 produces no routing decision at all: no move line.
 	// (It still appears in the console report section, which lists every PR
 	// and is not part of the routing output.)
-	for _, prefix := range []string{"moved pr ", "would move pr ", "keeping pr "} {
+	for _, prefix := range []string{"moved pr ", "would move pr "} {
 		if strings.Contains(out, prefix+prURL(16)) {
 			t.Errorf("pr/16 must produce no %q line, got:\n%s", prefix, out)
 		}
 	}
-	// The counter invariant: each by-* count equals its moved + keeping lines.
 	conflictLines := strings.Count(out, "(merge-conflict)")
 	crLines := strings.Count(out, "(changes-requested)")
-	if conflictLines != 2 {
-		t.Errorf("expected 2 lines carrying (merge-conflict) to match by-conflict: 2, got %d:\n%s", conflictLines, out)
+	if conflictLines != 1 {
+		t.Errorf("expected 1 line carrying (merge-conflict), got %d:\n%s", conflictLines, out)
 	}
 	if crLines != 2 {
 		t.Errorf("expected 2 lines carrying (changes-requested) to match by-changes-requested: 2, got %d:\n%s", crLines, out)
