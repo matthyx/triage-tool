@@ -155,9 +155,12 @@ func TestClassifyReviewStatus(t *testing.T) {
 	human := func(login string) CommentEvent { return CommentEvent{Login: login} }
 	bot := func(login string) CommentEvent { return CommentEvent{Login: login, IsBot: true} }
 
+	multiTeam := []string{"matthyx", "alice"}
+
 	tests := []struct {
 		name   string
 		events []CommentEvent
+		team   []string
 		want   string
 	}{
 		{
@@ -180,22 +183,22 @@ func TestClassifyReviewStatus(t *testing.T) {
 			// coderabbitai is the dominant bot on these repos. It is normally caught
 			// by __typename; this pins the deny-list as an independent second line.
 			name:   "coderabbitai after matthyx, caught by deny-list alone",
-			events: []CommentEvent{human(meLogin), human("coderabbitai")},
+			events: []CommentEvent{human("matthyx"), human("coderabbitai")},
 			want:   statusWaitingOnAuthor,
 		},
 		{
 			name:   "matthyx spoke last",
-			events: []CommentEvent{human("author"), human(meLogin)},
+			events: []CommentEvent{human("author"), human("matthyx")},
 			want:   statusWaitingOnAuthor,
 		},
 		{
 			name:   "matthyx earlier and a human replied",
-			events: []CommentEvent{human(meLogin), human("author")},
+			events: []CommentEvent{human("matthyx"), human("author")},
 			want:   statusNeedsReviewer,
 		},
 		{
 			name:   "matthyx earlier and only a bot spoke after",
-			events: []CommentEvent{human(meLogin), bot("coderabbitai")},
+			events: []CommentEvent{human("matthyx"), bot("coderabbitai")},
 			want:   statusWaitingOnAuthor,
 		},
 		{
@@ -205,14 +208,42 @@ func TestClassifyReviewStatus(t *testing.T) {
 		},
 		{
 			name:   "matthyx is the only participant",
-			events: []CommentEvent{human(meLogin)},
+			events: []CommentEvent{human("matthyx")},
 			want:   statusWaitingOnAuthor,
+		},
+		{
+			name:   "multi-member team: alice spoke last",
+			events: []CommentEvent{human("author"), human("alice")},
+			team:   multiTeam,
+			want:   statusWaitingOnAuthor,
+		},
+		{
+			name:   "multi-member team: matthyx spoke first, alice spoke last",
+			events: []CommentEvent{human("matthyx"), human("author"), human("alice")},
+			team:   multiTeam,
+			want:   statusWaitingOnAuthor,
+		},
+		{
+			name:   "multi-member team: alice spoke earlier and author replied",
+			events: []CommentEvent{human("alice"), human("author")},
+			team:   multiTeam,
+			want:   statusNeedsReviewer,
+		},
+		{
+			name:   "multi-member team: neither matthyx nor alice participated",
+			events: []CommentEvent{human("author"), human("reviewer")},
+			team:   multiTeam,
+			want:   "",
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := classifyReviewStatus(tc.events, meLogin); got != tc.want {
+			team := tc.team
+			if team == nil {
+				team = myTeam
+			}
+			if got := classifyReviewStatus(tc.events, team); got != tc.want {
 				t.Errorf("classifyReviewStatus() = %q, want %q", got, tc.want)
 			}
 		})
@@ -440,16 +471,16 @@ func (f *routingFixture) client() *MockGHClient {
 	bot := func(login string) CommentEvent { return CommentEvent{Login: login, IsBot: true} }
 
 	prs := []PullRequestDetail{
-		{URL: prURL(1), Author: "author", Conversation: conv(human("someone"), human(meLogin))},
-		{URL: prURL(2), Author: "author", Conversation: conv(human(meLogin), human("author"))},
-		{URL: prURL(3), Author: "author", Conversation: conv(human(meLogin), human("author"))},
-		{URL: prURL(4), Author: "author", Conversation: conv(human("someone"), human(meLogin))},
-		{URL: prURL(5), Author: "author", Conversation: conv(human("someone"), human(meLogin))},
-		{URL: prURL(6), Author: "author", Conversation: conv(human("someone"), human(meLogin))},
-		{URL: prURL(7), Author: "author", ReviewDecision: "APPROVED", Conversation: conv(human("someone"), human(meLogin))},
-		{URL: prURL(8), Author: "author", IsDraft: true, Conversation: conv(human("someone"), human(meLogin))},
-		{URL: prURL(9), Author: meLogin, Conversation: conv(human("someone"), human(meLogin))},
-		{URL: prURL(10), Author: "author", Conversation: conv(human(meLogin), bot("dependabot"))},
+		{URL: prURL(1), Author: "author", Conversation: conv(human("someone"), human("matthyx"))},
+		{URL: prURL(2), Author: "author", Conversation: conv(human("matthyx"), human("author"))},
+		{URL: prURL(3), Author: "author", Conversation: conv(human("matthyx"), human("author"))},
+		{URL: prURL(4), Author: "author", Conversation: conv(human("someone"), human("matthyx"))},
+		{URL: prURL(5), Author: "author", Conversation: conv(human("someone"), human("matthyx"))},
+		{URL: prURL(6), Author: "author", Conversation: conv(human("someone"), human("matthyx"))},
+		{URL: prURL(7), Author: "author", ReviewDecision: "APPROVED", Conversation: conv(human("someone"), human("matthyx"))},
+		{URL: prURL(8), Author: "author", IsDraft: true, Conversation: conv(human("someone"), human("matthyx"))},
+		{URL: prURL(9), Author: "matthyx", Conversation: conv(human("someone"), human("matthyx"))},
+		{URL: prURL(10), Author: "author", Conversation: conv(human("matthyx"), bot("dependabot"))},
 	}
 
 	items := []ProjectItem{
@@ -684,25 +715,25 @@ func TestChangesRequestedOutstanding(t *testing.T) {
 		{
 			name: "review decision is not CHANGES_REQUESTED",
 			pr: PullRequestDetail{Author: "author", ReviewDecision: "APPROVED",
-				Conversation: []CommentEvent{cr(base, meLogin)}},
+				Conversation: []CommentEvent{cr(base, "matthyx")}},
 			want: false,
 		},
 		{
 			name: "change request with nothing after it",
 			pr: PullRequestDetail{Author: "author", ReviewDecision: reviewChangesRequested,
-				Conversation: []CommentEvent{cr(base, meLogin)}},
+				Conversation: []CommentEvent{cr(base, "matthyx")}},
 			want: true,
 		},
 		{
 			name: "addressed by a later commit",
 			pr: PullRequestDetail{Author: "author", ReviewDecision: reviewChangesRequested,
-				Conversation: []CommentEvent{cr(base, meLogin)}, LastCommitAt: base.Add(time.Hour)},
+				Conversation: []CommentEvent{cr(base, "matthyx")}, LastCommitAt: base.Add(time.Hour)},
 			want: false,
 		},
 		{
 			name: "addressed by a later author comment",
 			pr: PullRequestDetail{Author: "author", ReviewDecision: reviewChangesRequested,
-				Conversation: []CommentEvent{cr(base, meLogin), at(base.Add(time.Hour), "author")}},
+				Conversation: []CommentEvent{cr(base, "matthyx"), at(base.Add(time.Hour), "author")}},
 			want: false,
 		},
 		{
@@ -710,19 +741,19 @@ func TestChangesRequestedOutstanding(t *testing.T) {
 			// the author having addressed anything.
 			name: "later comment by a non-author human",
 			pr: PullRequestDetail{Author: "author", ReviewDecision: reviewChangesRequested,
-				Conversation: []CommentEvent{cr(base, meLogin), at(base.Add(time.Hour), "thirdparty")}},
+				Conversation: []CommentEvent{cr(base, "matthyx"), at(base.Add(time.Hour), "thirdparty")}},
 			want: true,
 		},
 		{
 			name: "later comment by a bot",
 			pr: PullRequestDetail{Author: "author", ReviewDecision: reviewChangesRequested,
-				Conversation: []CommentEvent{cr(base, meLogin), botAt(base.Add(time.Hour), "coderabbitai")}},
+				Conversation: []CommentEvent{cr(base, "matthyx"), botAt(base.Add(time.Hour), "coderabbitai")}},
 			want: true,
 		},
 		{
 			name: "author comment predates the change request",
 			pr: PullRequestDetail{Author: "author", ReviewDecision: reviewChangesRequested,
-				Conversation: []CommentEvent{at(base.Add(-time.Hour), "author"), cr(base, meLogin)}},
+				Conversation: []CommentEvent{at(base.Add(-time.Hour), "author"), cr(base, "matthyx")}},
 			want: true,
 		},
 		{
@@ -731,9 +762,9 @@ func TestChangesRequestedOutstanding(t *testing.T) {
 			name: "two change requests, only the older is addressed",
 			pr: PullRequestDetail{Author: "author", ReviewDecision: reviewChangesRequested,
 				Conversation: []CommentEvent{
-					cr(base.Add(-2*time.Hour), meLogin),
+					cr(base.Add(-2*time.Hour), "matthyx"),
 					at(base.Add(-time.Hour), "author"),
-					cr(base, meLogin),
+					cr(base, "matthyx"),
 				}},
 			want: true,
 		},
@@ -754,7 +785,7 @@ func TestChangesRequestedOutstanding(t *testing.T) {
 		{
 			name: "zero LastCommitAt falls through to the author-reply check",
 			pr: PullRequestDetail{Author: "author", ReviewDecision: reviewChangesRequested,
-				Conversation: []CommentEvent{cr(base, meLogin)}, LastCommitAt: time.Time{}},
+				Conversation: []CommentEvent{cr(base, "matthyx")}, LastCommitAt: time.Time{}},
 			want: true,
 		},
 		{
@@ -772,7 +803,7 @@ func TestChangesRequestedOutstanding(t *testing.T) {
 			// future commit-authorship filter must consciously flip this row.
 			name: "later commit whose committer is not the PR author still reads as addressed",
 			pr: PullRequestDetail{Author: "entlein", ReviewDecision: reviewChangesRequested,
-				Conversation: []CommentEvent{cr(base, meLogin)}, LastCommitAt: base.Add(720 * time.Hour)},
+				Conversation: []CommentEvent{cr(base, "matthyx")}, LastCommitAt: base.Add(720 * time.Hour)},
 			want: false,
 		},
 	}
@@ -790,8 +821,8 @@ func TestRouteTarget(t *testing.T) {
 	base := signalBase
 	// needsReviewerConv classifies as "Needs Reviewer": me spoke, someone else
 	// spoke last. waitingConv classifies as "Waiting on Author": me spoke last.
-	needsReviewerConv := []CommentEvent{at(base.Add(-2*time.Hour), meLogin), at(base.Add(-time.Hour), "author")}
-	waitingConv := []CommentEvent{at(base.Add(-2*time.Hour), "author"), at(base.Add(-time.Hour), meLogin)}
+	needsReviewerConv := []CommentEvent{at(base.Add(-2*time.Hour), "matthyx"), at(base.Add(-time.Hour), "author")}
+	waitingConv := []CommentEvent{at(base.Add(-2*time.Hour), "author"), at(base.Add(-time.Hour), "matthyx")}
 	// noneConv never mentions me, so classifyReviewStatus returns "".
 	noneConv := []CommentEvent{at(base.Add(-2*time.Hour), "author"), at(base.Add(-time.Hour), "thirdparty")}
 	// crConv classifies as "Needs Reviewer" AND carries an outstanding change
@@ -800,8 +831,8 @@ func TestRouteTarget(t *testing.T) {
 	// not be the final event, or me would be the last speaker and the classifier
 	// would say "Waiting on Author" instead.
 	crConv := []CommentEvent{
-		at(base.Add(-2*time.Hour), meLogin),
-		cr(base, meLogin),
+		at(base.Add(-2*time.Hour), "matthyx"),
+		cr(base, "matthyx"),
 		at(base.Add(time.Hour), "thirdparty"),
 	}
 	// crNoneConv carries the same outstanding change request but from a reviewer
@@ -816,6 +847,7 @@ func TestRouteTarget(t *testing.T) {
 	tests := []struct {
 		name       string
 		pr         PullRequestDetail
+		team       []string
 		wantTarget string
 		wantReason string
 	}{
@@ -877,13 +909,19 @@ func TestRouteTarget(t *testing.T) {
 		},
 		{
 			name: "own PR is unconditionally routed to WIP",
-			pr: PullRequestDetail{Author: meLogin, Conversation: needsReviewerConv,
+			pr: PullRequestDetail{Author: "matthyx", Conversation: needsReviewerConv,
 				ReviewDecision: reviewChangesRequested, Mergeable: mergeableConflicting},
 			wantTarget: statusWIP, wantReason: reasonOwnPR,
 		},
 		{
 			name:       "own PR with no conversation is unconditionally routed to WIP",
-			pr:         PullRequestDetail{Author: meLogin},
+			pr:         PullRequestDetail{Author: "matthyx"},
+			wantTarget: statusWIP, wantReason: reasonOwnPR,
+		},
+		{
+			name: "own PR by another team member is unconditionally routed to WIP",
+			pr:   PullRequestDetail{Author: "alice", Conversation: needsReviewerConv},
+			team: []string{"matthyx", "alice"},
 			wantTarget: statusWIP, wantReason: reasonOwnPR,
 		},
 		{
@@ -900,7 +938,11 @@ func TestRouteTarget(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			target, reason := routeTarget(tc.pr, meLogin)
+			team := tc.team
+			if team == nil {
+				team = myTeam
+			}
+			target, reason := routeTarget(tc.pr, team)
 			if target != tc.wantTarget || reason != tc.wantReason {
 				t.Errorf("routeTarget() = (%q, %q), want (%q, %q)", target, reason, tc.wantTarget, tc.wantReason)
 			}
@@ -931,10 +973,10 @@ func TestRouteTargetMonotonicity(t *testing.T) {
 	conversations := map[string][]CommentEvent{
 		"empty":                 {},
 		"bot-only":              {botAt(before, "coderabbitai"), botAt(after, "dependabot")},
-		"me-last":               {at(before, "author"), cr(base, meLogin)},
-		"other-last-me-present": {at(before, meLogin), cr(base, "reviewer"), at(after, "thirdparty")},
+		"me-last":               {at(before, "author"), cr(base, "matthyx")},
+		"other-last-me-present": {at(before, "matthyx"), cr(base, "reviewer"), at(after, "thirdparty")},
 		"other-last-me-absent":  {cr(base, "reviewer"), at(after, "thirdparty")},
-		"author-last":           {at(before, meLogin), cr(base, "reviewer"), at(after, "author")},
+		"author-last":           {at(before, "matthyx"), cr(base, "reviewer"), at(after, "author")},
 	}
 	convNames := []string{"empty", "bot-only", "me-last", "other-last-me-present", "other-last-me-absent", "author-last"}
 	decisions := []string{"", "APPROVED", "CHANGES_REQUESTED", "REVIEW_REQUIRED"}
@@ -955,8 +997,8 @@ func TestRouteTargetMonotonicity(t *testing.T) {
 						Mergeable:      mergeable,
 						LastCommitAt:   commitTimes[tn],
 					}
-					got, reason := routeTarget(pr, meLogin)
-					want := classifyReviewStatus(pr.Conversation, meLogin)
+					got, reason := routeTarget(pr, myTeam)
+					want := classifyReviewStatus(pr.Conversation, myTeam)
 					desc := fmt.Sprintf("conv=%s decision=%q mergeable=%q commit=%s", cn, decision, mergeable, tn)
 
 					// 2. No candidate is created.
@@ -1000,38 +1042,38 @@ func signalExtras(f *routingFixture) {
 	f.extraPRs = []PullRequestDetail{
 		// Conflict pins a "Needs Reviewer" verdict to "Waiting on Author".
 		{URL: prURL(11), Author: "author", Mergeable: mergeableConflicting,
-			Conversation: []CommentEvent{at(base, meLogin), at(base.Add(time.Hour), "author")}},
+			Conversation: []CommentEvent{at(base, "matthyx"), at(base.Add(time.Hour), "author")}},
 		// A11: UNKNOWN is no signal, so plain last-commenter routing applies.
 		{URL: prURL(12), Author: "author", Mergeable: "UNKNOWN",
-			Conversation: []CommentEvent{at(base, meLogin), at(base.Add(time.Hour), "author")}},
+			Conversation: []CommentEvent{at(base, "matthyx"), at(base.Add(time.Hour), "author")}},
 		// The reported G2 gap: a third party spoke after the change request.
 		{URL: prURL(13), Author: "author", ReviewDecision: reviewChangesRequested,
-			Conversation: []CommentEvent{cr(base, meLogin), at(base.Add(time.Hour), "thirdparty")}},
+			Conversation: []CommentEvent{cr(base, "matthyx"), at(base.Add(time.Hour), "thirdparty")}},
 		// D2: the author replied, so the change request is addressed.
 		{URL: prURL(14), Author: "author", ReviewDecision: reviewChangesRequested,
-			Conversation: []CommentEvent{cr(base, meLogin), at(base.Add(time.Hour), "author")}},
+			Conversation: []CommentEvent{cr(base, "matthyx"), at(base.Add(time.Hour), "author")}},
 		// D1: a newer commit addresses the change request.
 		{URL: prURL(15), Author: "author", ReviewDecision: reviewChangesRequested,
 			LastCommitAt: base.Add(2 * time.Hour),
-			Conversation: []CommentEvent{cr(base, meLogin), at(base.Add(time.Hour), "thirdparty")}},
+			Conversation: []CommentEvent{cr(base, "matthyx"), at(base.Add(time.Hour), "thirdparty")}},
 		// Monotonicity: matthyx never spoke, so no signal may create a candidate.
 		{URL: prURL(16), Author: "author", Mergeable: mergeableConflicting,
 			ReviewDecision: reviewChangesRequested, Conversation: []CommentEvent{}},
 		// Stale approved label: reported, never mutated.
 		{URL: prURL(17), Author: "author", ReviewDecision: reviewApproved,
-			Conversation: []CommentEvent{at(base, meLogin), at(base.Add(time.Hour), "author")}},
+			Conversation: []CommentEvent{at(base, "matthyx"), at(base.Add(time.Hour), "author")}},
 		// Already in the decided column: no mutation, but a keeping line and a
 		// by-conflict increment. This is the row that pins the counter/line 1:1
 		// invariant - without it the correspondence is vacuously satisfied.
 		{URL: prURL(18), Author: "author", Mergeable: mergeableConflicting,
-			Conversation: []CommentEvent{at(base, meLogin), at(base.Add(time.Hour), "author")}},
+			Conversation: []CommentEvent{at(base, "matthyx"), at(base.Add(time.Hour), "author")}},
 		// Reviewer-generic: the change request is dakshhhhh16's. The leading
-		// meLogin event exists only to open the P1 gate (the classifier needs me
+		// "matthyx" event exists only to open the P1 gate (the classifier needs me
 		// to have participated); it changes nothing about which reviewer's change
 		// request newestChangeRequestAt finds.
 		{URL: prURL(19), Author: "author", ReviewDecision: reviewChangesRequested,
 			Conversation: []CommentEvent{
-				at(base.Add(-time.Hour), meLogin),
+				at(base.Add(-time.Hour), "matthyx"),
 				cr(base, "dakshhhhh16"),
 				at(base.Add(time.Hour), "thirdparty"),
 			}},

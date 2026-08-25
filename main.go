@@ -25,7 +25,6 @@ const (
 	bugTrackingBoard      = "4"
 	prTrackingBoard       = "5"
 	staleThresholdDays    = 7
-	meLogin               = "matthyx"
 	statusFieldName       = "Status"
 	statusToArchive       = "To Archive"
 	statusWaitingOnAuthor = "Waiting on Author"
@@ -48,6 +47,8 @@ const (
 	reasonLastCommenter    = "last-commenter"
 	reasonOwnPR            = "own-pr"
 )
+
+var myTeam = []string{"matthyx", "entlein"}
 
 // routableStatuses are the only current statuses the routing rule may overwrite.
 // "To Archive" is deliberately absent: a human can park an open PR there to mean
@@ -270,7 +271,7 @@ func isBotLogin(login string) bool {
 
 // classifyReviewStatus returns the target column name for a PR given its
 // chronological (oldest first) conversation, or "" when no move applies.
-func classifyReviewStatus(events []CommentEvent, me string) string {
+func classifyReviewStatus(events []CommentEvent, team []string) string {
 	var humans []CommentEvent
 	for _, e := range events {
 		if e.IsBot || isBotLogin(e.Login) {
@@ -281,11 +282,11 @@ func classifyReviewStatus(events []CommentEvent, me string) string {
 	if len(humans) == 0 {
 		return ""
 	}
-	if humans[len(humans)-1].Login == me {
+	if slices.Contains(team, humans[len(humans)-1].Login) {
 		return statusWaitingOnAuthor
 	}
-	// me participated and someone else spoke last, so me was replied to.
-	if slices.ContainsFunc(humans, func(e CommentEvent) bool { return e.Login == me }) {
+	// a team member participated and someone else spoke last, so the team was replied to.
+	if slices.ContainsFunc(humans, func(e CommentEvent) bool { return slices.Contains(team, e.Login) }) {
 		return statusNeedsReviewer
 	}
 	return ""
@@ -293,8 +294,8 @@ func classifyReviewStatus(events []CommentEvent, me string) string {
 
 // newestChangeRequestAt returns the time of the newest non-bot CHANGES_REQUESTED
 // review in the conversation, and whether one was found. It is generic over the
-// reviewer: any human reviewer's change request counts, not just meLogin's, so
-// this function never references meLogin. It scans the whole slice rather than
+// reviewer: any human reviewer's change request counts, not just team members', so
+// this function never references myTeam. It scans the whole slice rather than
 // assuming the caller sorted it.
 func newestChangeRequestAt(events []CommentEvent) (time.Time, bool) {
 	var newest time.Time
@@ -353,12 +354,12 @@ func changesRequestedOutstanding(pr PullRequestDetail) bool {
 // redirect a move toward "Waiting on Author"; neither can create a move the
 // last-commenter rule did not already produce. Returns ("", "") when no move
 // applies.
-func routeTarget(pr PullRequestDetail, me string) (string, string) {
-	if pr.Author == me {
+func routeTarget(pr PullRequestDetail, team []string) (string, string) {
+	if slices.Contains(team, pr.Author) {
 		return statusWIP, reasonOwnPR
 	}
 	// P0: the frozen last-commenter rule.
-	target := classifyReviewStatus(pr.Conversation, me)
+	target := classifyReviewStatus(pr.Conversation, team)
 	// P1: MONOTONICITY GATE. No signal may create a routing candidate the
 	// last-commenter rule did not already produce. Everything below this line
 	// depends on it; weakening it to make a test pass is never the right fix.
@@ -1184,7 +1185,7 @@ func Run(ctx context.Context, client GHClient) {
 			if !ok {
 				continue
 			}
-			target, reason := routeTarget(pr, meLogin)
+			target, reason := routeTarget(pr, myTeam)
 			if target == "" {
 				continue
 			}

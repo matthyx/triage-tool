@@ -2,7 +2,7 @@
 
 Keeps the `kubescape` GitHub Projects boards in sync with reality: it adds untracked
 open issues and pull requests to the bug and PR boards, moves closed or merged items
-to **To Archive**, moves own PRs (`matthyx`) to **WIP**, routes open PRs between **Waiting on Author**
+to **To Archive**, moves team PRs (`myTeam`) to **WIP**, routes open PRs between **Waiting on Author**
 and **Needs Reviewer** based on who spoke last in the conversation — plus whether the PR has a
 **merge conflict** or an **outstanding change request** — and prints a priority report of the PRs
 needing attention.
@@ -17,10 +17,10 @@ and prints the reason instead of guessing.
 
 Every routing decision is made by one function, in this fixed order:
 
-1. **Own PR.** If the PR is authored by `matthyx`, the column is *WIP*, reason `own-pr`.
+1. **Own / Team PR.** If the PR is authored by a member of `myTeam`, the column is *WIP*, reason `own-pr`.
 2. **Last commenter.** Work out the column the conversation implies: *Waiting on Author*
-   if I spoke last, *Needs Reviewer* if I took part and someone else replied.
-3. **Nothing to do.** If that rule has no opinion — I never spoke on the PR — the run
+   if someone on the team spoke last, *Needs Reviewer* if the team took part and someone else replied.
+3. **Nothing to do.** If that rule has no opinion — the team never spoke on the PR — the run
    stops here and the PR is left alone. No other signal can override this.
 4. **Merge conflict.** Otherwise, if GitHub reports the PR as `CONFLICTING`, the column
    is *Waiting on Author*, reason `merge-conflict`.
@@ -100,7 +100,7 @@ To disable only the **merge-conflict and change-request signals** while leaving
 last-commenter routing intact, replace the body of `routeTarget` with a single line:
 
 ```go
-return classifyReviewStatus(pr.Conversation, me), reasonLastCommenter
+return classifyReviewStatus(pr.Conversation, team), reasonLastCommenter
 ```
 
 That is the kill switch for this feature. It restores the previous behaviour exactly,
