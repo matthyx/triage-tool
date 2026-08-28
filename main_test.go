@@ -22,7 +22,6 @@ func init() {
 	}
 }
 
-
 type MockGHClient struct {
 	AddProjectItemFunc           func(ctx context.Context, owner, board, url string) error
 	GetProjectIDFunc             func(ctx context.Context, owner, board string) (string, error)
@@ -919,9 +918,9 @@ func TestRouteTarget(t *testing.T) {
 			wantTarget: statusWIP, wantReason: reasonOwnPR,
 		},
 		{
-			name: "own PR by another team member is unconditionally routed to WIP",
-			pr:   PullRequestDetail{Author: "alice", Conversation: needsReviewerConv},
-			team: []string{"matthyx", "alice"},
+			name:       "own PR by another team member is unconditionally routed to WIP",
+			pr:         PullRequestDetail{Author: "alice", Conversation: needsReviewerConv},
+			team:       []string{"matthyx", "alice"},
 			wantTarget: statusWIP, wantReason: reasonOwnPR,
 		},
 		{
@@ -1281,4 +1280,3 @@ func TestMulticaIssueInvocation(t *testing.T) {
 		t.Errorf("expected description %q, got %q", expectedDesc, calledWith[4])
 	}
 }
-

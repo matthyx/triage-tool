@@ -1,6 +1,6 @@
 module triage-tool
 
-go 1.26.0
+go 1.27
 
 require (
 	github.com/deckarep/golang-set/v2 v2.8.0
@@ -13,4 +13,5 @@ require (
 require (
 	github.com/gammazero/deque v1.2.0 // indirect
 	github.com/shurcooL/graphql v0.0.0-20240915155400-7ee5256398cf // indirect
+	golang.org/x/tools v0.49.0 // indirect
 )
