@@ -92,7 +92,7 @@ type GHClient interface {
 	AddProjectItem(ctx context.Context, owner, board, url string) error
 	GetProjectID(ctx context.Context, owner, board string) (string, error)
 	GetContentID(ctx context.Context, url string) (string, error)
-	AddProjectItemWithIDs(ctx context.Context, projectID, contentID string) error
+	AddProjectItemWithIDs(ctx context.Context, projectID, contentID string) (string, error)
 	GetProjectItemsWithState(ctx context.Context, owner, board string, limit int) ([]ProjectItem, error)
 	GetBothProjectItems(ctx context.Context, owner, bugBoard, prBoard string, limit int) (mapset.Set[string], mapset.Set[string], error)
 	GetIssuesAndPulls(ctx context.Context, repo string, limit int) ([]string, []PullRequestDetail, error)
@@ -406,7 +406,7 @@ func withRetry(fn func() error) error {
 	return nil
 }
 
-func (c *RealGHClient) AddProjectItemWithIDs(ctx context.Context, projectID, contentID string) error {
+func (c *RealGHClient) AddProjectItemWithIDs(ctx context.Context, projectID, contentID string) (string, error) {
 	var mutation struct {
 		AddProjectV2ItemById struct {
 			ClientMutationID string
@@ -426,7 +426,11 @@ func (c *RealGHClient) AddProjectItemWithIDs(ctx context.Context, projectID, con
 		ContentID: githubv4.ID(contentID),
 	}
 
-	return withRetry(func() error { return c.v4Client.Mutate(ctx, &mutation, input, nil) })
+	err := withRetry(func() error { return c.v4Client.Mutate(ctx, &mutation, input, nil) })
+	if err != nil {
+		return "", err
+	}
+	return mutation.AddProjectV2ItemById.Item.ID, nil
 }
 
 func (c *RealGHClient) AddProjectItem(ctx context.Context, owner, board, url string) error {
@@ -440,7 +444,8 @@ func (c *RealGHClient) AddProjectItem(ctx context.Context, owner, board, url str
 		return fmt.Errorf("failed to get content ID: %w", err)
 	}
 
-	return c.AddProjectItemWithIDs(ctx, projectID, contentID)
+	_, err = c.AddProjectItemWithIDs(ctx, projectID, contentID)
+	return err
 }
 
 func (c *RealGHClient) GetBothProjectItems(ctx context.Context, owner, bugBoard, prBoard string, limit int) (mapset.Set[string], mapset.Set[string], error) {
@@ -1045,6 +1050,9 @@ func Run(ctx context.Context, client GHClient) {
 		panic(errPR)
 	}
 
+	var newPRItemsMu sync.Mutex
+	var newPRItems []ProjectItem
+
 	wg.Go(func() {
 		wp := workerpool.New(runtime.GOMAXPROCS(0) * 4)
 		for _, url := range issueURLs {
@@ -1054,7 +1062,7 @@ func Run(ctx context.Context, client GHClient) {
 					fmt.Println("error adding issue", url, err)
 					return
 				}
-				err = client.AddProjectItemWithIDs(ctx, bugProjectID, contentID)
+				_, err = client.AddProjectItemWithIDs(ctx, bugProjectID, contentID)
 				if err != nil {
 					fmt.Println("error adding issue", url, err)
 				} else {
@@ -1073,16 +1081,29 @@ func Run(ctx context.Context, client GHClient) {
 					fmt.Println("error adding pr", url, err)
 					return
 				}
-				err = client.AddProjectItemWithIDs(ctx, prProjectID, contentID)
+				itemID, err := client.AddProjectItemWithIDs(ctx, prProjectID, contentID)
 				if err != nil {
 					fmt.Println("error adding pr", url, err)
 				} else {
 					fmt.Println("added pr", url)
-					if repoName, prNumber, ok := parsePRRepoAndNumber(url); ok {
-						if err := createMulticaIssue(ctx, repoName, prNumber, url); err != nil {
-							fmt.Printf("error creating multica issue for pr %s: %v\n", url, err)
-						} else {
-							fmt.Printf("created multica issue for pr %s\n", url)
+					newPRItemsMu.Lock()
+					newPRItems = append(newPRItems, ProjectItem{
+						ID:         itemID,
+						URL:        url,
+						Closed:     false,
+						InArchive:  false,
+						StatusName: "",
+					})
+					newPRItemsMu.Unlock()
+
+					pr := allPRDetails[url]
+					if !slices.Contains(myTeam, pr.Author) {
+						if repoName, prNumber, ok := parsePRRepoAndNumber(url); ok {
+							if err := createMulticaIssue(ctx, repoName, prNumber, url); err != nil {
+								fmt.Printf("error creating multica issue for pr %s: %v\n", url, err)
+							} else {
+								fmt.Printf("created multica issue for pr %s\n", url)
+							}
 						}
 					}
 				}
@@ -1091,6 +1112,8 @@ func Run(ctx context.Context, client GHClient) {
 		wp.StopWait()
 	})
 	wg.Wait()
+
+	prItems = append(prItems, newPRItems...)
 
 	// Archive closed/merged items on both boards
 	var bugFieldID, bugOptionID, prFieldID, prOptionID string

@@ -26,7 +26,7 @@ type MockGHClient struct {
 	AddProjectItemFunc           func(ctx context.Context, owner, board, url string) error
 	GetProjectIDFunc             func(ctx context.Context, owner, board string) (string, error)
 	GetContentIDFunc             func(ctx context.Context, url string) (string, error)
-	AddProjectItemWithIDsFunc    func(ctx context.Context, projectID, contentID string) error
+	AddProjectItemWithIDsFunc    func(ctx context.Context, projectID, contentID string) (string, error)
 	GetProjectItemsWithStateFunc func(ctx context.Context, owner, board string, limit int) ([]ProjectItem, error)
 	GetBothProjectItemsFunc      func(ctx context.Context, owner, bugBoard, prBoard string, limit int) (mapset.Set[string], mapset.Set[string], error)
 	GetIssuesAndPullsFunc        func(ctx context.Context, repo string, limit int) ([]string, []PullRequestDetail, error)
@@ -48,7 +48,7 @@ func (m *MockGHClient) GetContentID(ctx context.Context, url string) (string, er
 	return m.GetContentIDFunc(ctx, url)
 }
 
-func (m *MockGHClient) AddProjectItemWithIDs(ctx context.Context, projectID, contentID string) error {
+func (m *MockGHClient) AddProjectItemWithIDs(ctx context.Context, projectID, contentID string) (string, error) {
 	return m.AddProjectItemWithIDsFunc(ctx, projectID, contentID)
 }
 
@@ -120,11 +120,11 @@ func TestRun(t *testing.T) {
 		GetContentIDFunc: func(ctx context.Context, url string) (string, error) {
 			return "content-123", nil
 		},
-		AddProjectItemWithIDsFunc: func(ctx context.Context, projectID, contentID string) error {
+		AddProjectItemWithIDsFunc: func(ctx context.Context, projectID, contentID string) (string, error) {
 			mu.Lock()
 			defer mu.Unlock()
 			addedByProject[projectID]++
-			return nil
+			return "item-" + contentID, nil
 		},
 		AddProjectItemFunc: func(ctx context.Context, owner, board, url string) error {
 			return nil
@@ -368,8 +368,8 @@ func TestArchiveClosedItems(t *testing.T) {
 		GetContentIDFunc: func(ctx context.Context, url string) (string, error) {
 			return "content-123", nil
 		},
-		AddProjectItemWithIDsFunc: func(ctx context.Context, projectID, contentID string) error {
-			return nil
+		AddProjectItemWithIDsFunc: func(ctx context.Context, projectID, contentID string) (string, error) {
+			return "item-123", nil
 		},
 		AddProjectItemFunc: func(ctx context.Context, owner, board, url string) error {
 			return nil
@@ -517,8 +517,8 @@ func (f *routingFixture) client() *MockGHClient {
 		GetContentIDFunc: func(ctx context.Context, url string) (string, error) {
 			return "content-123", nil
 		},
-		AddProjectItemWithIDsFunc: func(ctx context.Context, projectID, contentID string) error {
-			return nil
+		AddProjectItemWithIDsFunc: func(ctx context.Context, projectID, contentID string) (string, error) {
+			return "item-123", nil
 		},
 		AddProjectItemFunc: func(ctx context.Context, owner, board, url string) error {
 			return nil
@@ -1280,3 +1280,97 @@ func TestMulticaIssueInvocation(t *testing.T) {
 		t.Errorf("expected description %q, got %q", expectedDesc, calledWith[4])
 	}
 }
+
+func TestUntrackedPRRoutingAndMultica(t *testing.T) {
+	ctx := t.Context()
+	var mu sync.Mutex
+	var multicaCreated []string
+	var updates []fieldUpdate
+
+	orig := createMulticaIssue
+	defer func() { createMulticaIssue = orig }()
+
+	createMulticaIssue = func(ctx context.Context, repoName, prNumber, fullURL string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		multicaCreated = append(multicaCreated, fullURL)
+		return nil
+	}
+
+	teamPRURL := "https://github.com/kubescape/node-agent/pull/936"
+	externalPRURL := "https://github.com/kubescape/node-agent/pull/937"
+
+	mockClient := &MockGHClient{
+		GetRepositoriesFunc: func(ctx context.Context, owner string, limit int) ([]string, error) {
+			return []string{"kubescape/node-agent"}, nil
+		},
+		GetIssuesAndPullsFunc: func(ctx context.Context, repo string, limit int) ([]string, []PullRequestDetail, error) {
+			return nil, []PullRequestDetail{
+				{
+					URL:        teamPRURL,
+					Title:      "Team PR",
+					Repository: repo,
+					Author:     "matthyx",
+				},
+				{
+					URL:        externalPRURL,
+					Title:      "External PR",
+					Repository: repo,
+					Author:     "external-user",
+				},
+			}, nil
+		},
+		GetProjectItemsWithStateFunc: func(ctx context.Context, owner, board string, limit int) ([]ProjectItem, error) {
+			return []ProjectItem{}, nil
+		},
+		GetProjectIDFunc: func(ctx context.Context, owner, board string) (string, error) {
+			return "project-" + board, nil
+		},
+		GetContentIDFunc: func(ctx context.Context, url string) (string, error) {
+			return "content-" + url, nil
+		},
+		AddProjectItemWithIDsFunc: func(ctx context.Context, projectID, contentID string) (string, error) {
+			return "item-" + contentID, nil
+		},
+		AddProjectItemFunc: func(ctx context.Context, owner, board, url string) error {
+			return nil
+		},
+		GetToArchiveFieldOptionFunc: func(ctx context.Context, owner, board string) (string, string, error) {
+			return "field-123", "option-archive", nil
+		},
+		GetSingleSelectOptionsFunc: func(ctx context.Context, owner, board string) (map[string]FieldOption, error) {
+			return statusOptions(), nil
+		},
+		UpdateProjectItemFieldFunc: func(ctx context.Context, projectID, itemID, fieldID, optionID string) error {
+			mu.Lock()
+			defer mu.Unlock()
+			updates = append(updates, fieldUpdate{projectID, itemID, fieldID, optionID})
+			return nil
+		},
+	}
+
+	out := captureOutput(t, func() { Run(ctx, mockClient) })
+
+	// Check multica issue creation: only external PR should trigger multica
+	if slices.Contains(multicaCreated, teamPRURL) {
+		t.Errorf("team PR %s should not have created a multica issue", teamPRURL)
+	}
+	if !slices.Contains(multicaCreated, externalPRURL) {
+		t.Errorf("external PR %s should have created a multica issue", externalPRURL)
+	}
+
+	// Check routing: newly added team PR must be moved to WIP
+	wantWIPUpdate := fieldUpdate{
+		projectID: "project-" + prTrackingBoard,
+		itemID:    "item-content-" + teamPRURL,
+		fieldID:   "field-123",
+		optionID:  "option-wip",
+	}
+	if !slices.Contains(updates, wantWIPUpdate) {
+		t.Errorf("missing expected WIP update %+v, got %+v", wantWIPUpdate, updates)
+	}
+	if !strings.Contains(out, "moved pr "+teamPRURL+` from "(none)" to "WIP" (own-pr)`) {
+		t.Errorf("expected output to mention moving team PR to WIP, got:\n%s", out)
+	}
+}
+
