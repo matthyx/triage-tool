@@ -1290,6 +1290,12 @@ func Run(ctx context.Context, client GHClient) {
 		}
 	}
 
+	slices.SortFunc(failingCIPRs, func(a, b PullRequestDetail) int {
+		return a.UpdatedAt.Compare(b.UpdatedAt)
+	})
+	slices.SortFunc(approvedPRs, func(a, b PullRequestDetail) int {
+		return a.UpdatedAt.Compare(b.UpdatedAt)
+	})
 	slices.SortFunc(staleOrWaitingPRs, func(a, b PullRequestDetail) int {
 		return a.UpdatedAt.Compare(b.UpdatedAt)
 	})
