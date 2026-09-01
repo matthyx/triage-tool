@@ -1491,3 +1491,76 @@ func TestAttentionListsSorting(t *testing.T) {
 	}
 }
 
+func TestApprovedPRWithMergeConflictExcludedFromReadyToMerge(t *testing.T) {
+	ctx := t.Context()
+	now := time.Now()
+
+	mockClient := &MockGHClient{
+		GetRepositoriesFunc: func(ctx context.Context, owner string, limit int) ([]string, error) {
+			return []string{"kubescape/repo1"}, nil
+		},
+		GetIssuesAndPullsFunc: func(ctx context.Context, repo string, limit int) ([]string, []PullRequestDetail, error) {
+			return nil, []PullRequestDetail{
+				{
+					URL:            "https://github.com/kubescape/repo1/pull/1",
+					Title:          "Approved clean PR",
+					Repository:     repo,
+					CIState:        "SUCCESS",
+					ReviewDecision: "APPROVED",
+					Mergeable:      "MERGEABLE",
+					UpdatedAt:      now.Add(-1 * 24 * time.Hour),
+				},
+				{
+					URL:            "https://github.com/kubescape/repo1/pull/2",
+					Title:          "Approved but conflicting PR",
+					Repository:     repo,
+					CIState:        "SUCCESS",
+					ReviewDecision: "APPROVED",
+					Mergeable:      mergeableConflicting,
+					UpdatedAt:      now.Add(-1 * 24 * time.Hour),
+				},
+			}, nil
+		},
+		GetProjectItemsWithStateFunc: func(ctx context.Context, owner, board string, limit int) ([]ProjectItem, error) {
+			return []ProjectItem{}, nil
+		},
+		GetProjectIDFunc: func(ctx context.Context, owner, board string) (string, error) {
+			return "project-" + board, nil
+		},
+		GetContentIDFunc: func(ctx context.Context, url string) (string, error) {
+			return "content-123", nil
+		},
+		AddProjectItemWithIDsFunc: func(ctx context.Context, projectID, contentID string) (string, error) {
+			return "item-123", nil
+		},
+		AddProjectItemFunc: func(ctx context.Context, owner, board, url string) error {
+			return nil
+		},
+		GetToArchiveFieldOptionFunc: func(ctx context.Context, owner, board string) (string, string, error) {
+			return "field-123", "option-archive", nil
+		},
+		GetSingleSelectOptionsFunc: func(ctx context.Context, owner, board string) (map[string]FieldOption, error) {
+			return statusOptions(), nil
+		},
+		UpdateProjectItemFieldFunc: func(ctx context.Context, projectID, itemID, fieldID, optionID string) error {
+			return nil
+		},
+	}
+
+	out := captureOutput(t, func() { Run(ctx, mockClient) })
+
+	attnSectionIdx := strings.Index(out, "APPROVED & READY TO MERGE:")
+	if attnSectionIdx == -1 {
+		t.Fatalf("missing APPROVED & READY TO MERGE header in output")
+	}
+	attnOut := out[attnSectionIdx:]
+
+	if !strings.Contains(attnOut, "https://github.com/kubescape/repo1/pull/1") {
+		t.Errorf("expected clean approved PR (pull/1) in APPROVED & READY TO MERGE section, output:\n%s", attnOut)
+	}
+	if strings.Contains(attnOut, "https://github.com/kubescape/repo1/pull/2") {
+		t.Errorf("expected conflicting approved PR (pull/2) to be excluded from APPROVED & READY TO MERGE section, output:\n%s", attnOut)
+	}
+}
+
+

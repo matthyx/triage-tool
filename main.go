@@ -1275,7 +1275,7 @@ func Run(ctx context.Context, client GHClient) {
 			continue
 		}
 		// Priority 2: Approved & Ready to Merge
-		if pr.ReviewDecision == "APPROVED" {
+		if pr.ReviewDecision == reviewApproved && pr.Mergeable != mergeableConflicting {
 			approvedPRs = append(approvedPRs, pr)
 			continue
 		}
