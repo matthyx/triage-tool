@@ -1362,7 +1362,7 @@ func defaultCreateMulticaIssue(ctx context.Context, repoName, prNumber, fullURL 
 	description := fmt.Sprintf("review %s add PR comments on blockers, when it's good to merge approve", fullURL)
 
 	cmd := exec.CommandContext(ctx, "multica", "issue", "create",
-		"--assignee", "Claude",
+		"--assignee", "Codex",
 		"--title", title,
 		"--description", description,
 	)
