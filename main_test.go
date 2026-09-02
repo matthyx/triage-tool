@@ -1406,6 +1406,7 @@ func TestAttentionListsSorting(t *testing.T) {
 					Repository:     repo,
 					CIState:        "SUCCESS",
 					ReviewDecision: "APPROVED",
+					Mergeable:      mergeableMergeable,
 					UpdatedAt:      now.Add(-1 * 24 * time.Hour),
 				},
 				{
@@ -1414,6 +1415,7 @@ func TestAttentionListsSorting(t *testing.T) {
 					Repository:     repo,
 					CIState:        "SUCCESS",
 					ReviewDecision: "APPROVED",
+					Mergeable:      mergeableMergeable,
 					UpdatedAt:      now.Add(-4 * 24 * time.Hour),
 				},
 				// Stale / Waiting PRs in reverse chronological order
@@ -1519,6 +1521,15 @@ func TestApprovedPRWithMergeConflictExcludedFromReadyToMerge(t *testing.T) {
 					Mergeable:      mergeableConflicting,
 					UpdatedAt:      now.Add(-1 * 24 * time.Hour),
 				},
+				{
+					URL:            "https://github.com/kubescape/repo1/pull/3",
+					Title:          "Approved but unknown mergeability PR",
+					Repository:     repo,
+					CIState:        "SUCCESS",
+					ReviewDecision: "APPROVED",
+					Mergeable:      "UNKNOWN",
+					UpdatedAt:      now.Add(-1 * 24 * time.Hour),
+				},
 			}, nil
 		},
 		GetProjectItemsWithStateFunc: func(ctx context.Context, owner, board string, limit int) ([]ProjectItem, error) {
@@ -1560,6 +1571,9 @@ func TestApprovedPRWithMergeConflictExcludedFromReadyToMerge(t *testing.T) {
 	}
 	if strings.Contains(attnOut, "https://github.com/kubescape/repo1/pull/2") {
 		t.Errorf("expected conflicting approved PR (pull/2) to be excluded from APPROVED & READY TO MERGE section, output:\n%s", attnOut)
+	}
+	if strings.Contains(attnOut, "https://github.com/kubescape/repo1/pull/3") {
+		t.Errorf("expected unknown mergeability approved PR (pull/3) to be excluded from APPROVED & READY TO MERGE section, output:\n%s", attnOut)
 	}
 }
 

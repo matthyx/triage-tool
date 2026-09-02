@@ -35,6 +35,7 @@ const (
 	// mergeableConflicting is the one MergeableState that means the author must
 	// act. MERGEABLE, UNKNOWN and "" are treated as absence of signal.
 	mergeableConflicting = "CONFLICTING"
+	mergeableMergeable   = "MERGEABLE"
 	// reviewChangesRequested is both a Review.state and a reviewDecision value.
 	reviewChangesRequested = "CHANGES_REQUESTED"
 	// reviewApproved is a reviewDecision value.
@@ -1275,7 +1276,7 @@ func Run(ctx context.Context, client GHClient) {
 			continue
 		}
 		// Priority 2: Approved & Ready to Merge
-		if pr.ReviewDecision == reviewApproved && pr.Mergeable != mergeableConflicting {
+		if pr.ReviewDecision == reviewApproved && pr.Mergeable == mergeableMergeable {
 			approvedPRs = append(approvedPRs, pr)
 			continue
 		}
