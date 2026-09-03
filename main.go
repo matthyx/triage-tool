@@ -577,106 +577,120 @@ func (c *RealGHClient) GetProjectItems(ctx context.Context, owner, board string,
 
 func (c *RealGHClient) GetProjectItemsWithState(ctx context.Context, owner, board string, limit int) ([]ProjectItem, error) {
 	var items []ProjectItem
-	var cursor *githubv4.String
+	seenIDs := make(map[string]bool)
 
-	for {
-		var query struct {
-			Organization struct {
-				ProjectV2 struct {
-					Items struct {
-						Nodes []struct {
-							ID      string
-							Content struct {
-								Issue struct {
-									URL   string
-									State string
-								} `graphql:"... on Issue"`
-								PullRequest struct {
-									URL   string
-									State string
-								} `graphql:"... on PullRequest"`
-							}
-							FieldValues struct {
-								Nodes []struct {
-									SingleSelectValue struct {
-										Name  string
-										Field struct {
-											SingleSelectField struct {
-												Name string
-											} `graphql:"... on ProjectV2SingleSelectField"`
-										}
-									} `graphql:"... on ProjectV2ItemFieldSingleSelectValue"`
+	filterQueries := []string{
+		fmt.Sprintf("-status:%q", statusToArchive),
+		fmt.Sprintf("status:%q is:open", statusToArchive),
+	}
+
+	for _, filterQuery := range filterQueries {
+		var cursor *githubv4.String
+		for {
+			var query struct {
+				Organization struct {
+					ProjectV2 struct {
+						Items struct {
+							Nodes []struct {
+								ID      string
+								Content struct {
+									Issue struct {
+										URL   string
+										State string
+									} `graphql:"... on Issue"`
+									PullRequest struct {
+										URL   string
+										State string
+									} `graphql:"... on PullRequest"`
 								}
-							} `graphql:"fieldValues(first: 20)"`
-						}
-						PageInfo struct {
-							HasNextPage bool
-							EndCursor   githubv4.String
-						}
-					} `graphql:"items(first: $limit, after: $cursor)"`
-				} `graphql:"projectV2(number: $board)"`
-			} `graphql:"organization(login: $owner)"`
-		}
+								FieldValues struct {
+									Nodes []struct {
+										SingleSelectValue struct {
+											Name  string
+											Field struct {
+												SingleSelectField struct {
+													Name string
+												} `graphql:"... on ProjectV2SingleSelectField"`
+											}
+										} `graphql:"... on ProjectV2ItemFieldSingleSelectValue"`
+									}
+								} `graphql:"fieldValues(first: 20)"`
+							}
+							PageInfo struct {
+								HasNextPage bool
+								EndCursor   githubv4.String
+							}
+						} `graphql:"items(first: $limit, after: $cursor, query: $filterQuery)"`
+					} `graphql:"projectV2(number: $board)"`
+				} `graphql:"organization(login: $owner)"`
+			}
 
-		boardNum, _ := strconv.Atoi(board)
-		variables := map[string]any{
-			"owner":  githubv4.String(owner),
-			"board":  githubv4.Int(boardNum),
-			"limit":  githubv4.Int(limit),
-			"cursor": cursor,
-		}
+			boardNum, _ := strconv.Atoi(board)
+			variables := map[string]any{
+				"owner":       githubv4.String(owner),
+				"board":       githubv4.Int(boardNum),
+				"limit":       githubv4.Int(limit),
+				"cursor":      cursor,
+				"filterQuery": githubv4.String(filterQuery),
+			}
 
-		err := c.v4Client.Query(ctx, &query, variables)
-		if err != nil {
-			return nil, err
-		}
+			err := c.v4Client.Query(ctx, &query, variables)
+			if err != nil {
+				return nil, err
+			}
 
-		for _, node := range query.Organization.ProjectV2.Items.Nodes {
-			// githubv4 merges overlapping inline fragment fields, so Issue and
-			// PullRequest structs both receive the same URL and state values.
-			// Use Issue fields (always populated) and check both CLOSED and MERGED
-			// so that merged PRs are correctly treated as closed.
-			url := node.Content.Issue.URL
-			if url == "" {
-				url = node.Content.PullRequest.URL
-			}
-			if url == "" {
-				continue
-			}
-			state := node.Content.Issue.State
-			if state == "" {
-				state = node.Content.PullRequest.State
-			}
-			inArchive := false
-			for _, fv := range node.FieldValues.Nodes {
-				if fv.SingleSelectValue.Name == "To Archive" {
-					inArchive = true
-					break
-				}
-			}
-			var values []singleSelectValue
-			for _, fv := range node.FieldValues.Nodes {
-				if fv.SingleSelectValue.Name == "" {
+			for _, node := range query.Organization.ProjectV2.Items.Nodes {
+				if seenIDs[node.ID] {
 					continue
 				}
-				values = append(values, singleSelectValue{
-					FieldName:  fv.SingleSelectValue.Field.SingleSelectField.Name,
-					OptionName: fv.SingleSelectValue.Name,
+				seenIDs[node.ID] = true
+
+				// githubv4 merges overlapping inline fragment fields, so Issue and
+				// PullRequest structs both receive the same URL and state values.
+				// Use Issue fields (always populated) and check both CLOSED and MERGED
+				// so that merged PRs are correctly treated as closed.
+				url := node.Content.Issue.URL
+				if url == "" {
+					url = node.Content.PullRequest.URL
+				}
+				if url == "" {
+					continue
+				}
+				state := node.Content.Issue.State
+				if state == "" {
+					state = node.Content.PullRequest.State
+				}
+				inArchive := false
+				for _, fv := range node.FieldValues.Nodes {
+					if fv.SingleSelectValue.Name == statusToArchive {
+						inArchive = true
+						break
+					}
+				}
+				var values []singleSelectValue
+				for _, fv := range node.FieldValues.Nodes {
+					if fv.SingleSelectValue.Name == "" {
+						continue
+					}
+					values = append(values, singleSelectValue{
+						FieldName:  fv.SingleSelectValue.Field.SingleSelectField.Name,
+						OptionName: fv.SingleSelectValue.Name,
+					})
+				}
+				items = append(items, ProjectItem{
+					ID:         node.ID,
+					URL:        url,
+					Closed:     state == "CLOSED" || state == "MERGED",
+					InArchive:  inArchive,
+					StatusName: resolveStatusName(values),
 				})
 			}
-			items = append(items, ProjectItem{
-				ID:         node.ID,
-				URL:        url,
-				Closed:     state == "CLOSED" || state == "MERGED",
-				InArchive:  inArchive,
-				StatusName: resolveStatusName(values),
-			})
-		}
 
-		if !query.Organization.ProjectV2.Items.PageInfo.HasNextPage {
-			break
+			if !query.Organization.ProjectV2.Items.PageInfo.HasNextPage {
+				break
+			}
+			cursor = new(query.Organization.ProjectV2.Items.PageInfo.EndCursor)
 		}
-		cursor = new(query.Organization.ProjectV2.Items.PageInfo.EndCursor)
 	}
 
 	return items, nil
@@ -902,7 +916,13 @@ func (c *RealGHClient) GetRepositories(ctx context.Context, owner string, limit 
 		Organization struct {
 			Repositories struct {
 				Nodes []struct {
-					Name string
+					Name   string
+					Issues struct {
+						TotalCount int
+					} `graphql:"issues(states: OPEN)"`
+					PullRequests struct {
+						TotalCount int
+					} `graphql:"pullRequests(states: OPEN)"`
 				}
 			} `graphql:"repositories(first: $limit, privacy: PUBLIC, isArchived: false)"`
 		} `graphql:"organization(login: $owner)"`
@@ -920,6 +940,9 @@ func (c *RealGHClient) GetRepositories(ctx context.Context, owner string, limit 
 
 	var names []string
 	for _, repo := range query.Organization.Repositories.Nodes {
+		if repo.Issues.TotalCount == 0 && repo.PullRequests.TotalCount == 0 {
+			continue
+		}
 		names = append(names, owner+"/"+repo.Name)
 	}
 	return names, nil
@@ -943,61 +966,69 @@ func Run(ctx context.Context, client GHClient) {
 	}()
 
 	limit := 100
-	repositories, err := client.GetRepositories(ctx, "kubescape", limit)
-	if err != nil {
-		panic(err)
-	}
-
-	issueChan := make(chan []string, max(runtime.GOMAXPROCS(0), len(repositories)))
-	pullChan := make(chan []PullRequestDetail, max(runtime.GOMAXPROCS(0), len(repositories)))
-	wp := workerpool.New(runtime.GOMAXPROCS(0) * 4)
-
-	for _, repo := range repositories {
-		wp.Submit(func() {
-			issues, pulls, err := client.GetIssuesAndPulls(ctx, repo, limit)
-			if err != nil {
-				fmt.Println("error processing repo:", repo, err)
-				return
-			}
-			if len(issues) > 0 {
-				issueChan <- issues
-			}
-			if len(pulls) > 0 {
-				pullChan <- pulls
-			}
-		})
-	}
-	wp.StopWait()
-	close(issueChan)
-	close(pullChan)
-
-	allIssues := mapset.NewSet[string]()
-	allPulls := mapset.NewSet[string]()
-	allPRDetails := make(map[string]PullRequestDetail)
-
-	for issues := range issueChan {
-		allIssues.Append(issues...)
-	}
-	for pulls := range pullChan {
-		for _, pr := range pulls {
-			allPulls.Add(pr.URL)
-			allPRDetails[pr.URL] = pr
-		}
-	}
-
-	fmt.Println("issues", allIssues.Cardinality())
-	fmt.Println("pulls", allPulls.Cardinality())
-
+	var allIssues, allPulls mapset.Set[string]
+	var allPRDetails map[string]PullRequestDetail
 	var bugItems, prItems []ProjectItem
 	var errI, errP error
-	var wg sync.WaitGroup
-	wg.Go(func() {
-		bugItems, errI = client.GetProjectItemsWithState(ctx, "kubescape", bugTrackingBoard, limit)
+
+	var initWG sync.WaitGroup
+
+	initWG.Go(func() {
+		var boardWG sync.WaitGroup
+		boardWG.Go(func() {
+			bugItems, errI = client.GetProjectItemsWithState(ctx, "kubescape", bugTrackingBoard, limit)
+		})
+		boardWG.Go(func() {
+			prItems, errP = client.GetProjectItemsWithState(ctx, "kubescape", prTrackingBoard, limit)
+		})
+		boardWG.Wait()
 	})
-	wg.Go(func() {
-		prItems, errP = client.GetProjectItemsWithState(ctx, "kubescape", prTrackingBoard, limit)
+
+	initWG.Go(func() {
+		repositories, err := client.GetRepositories(ctx, "kubescape", limit)
+		if err != nil {
+			panic(err)
+		}
+
+		issueChan := make(chan []string, max(runtime.GOMAXPROCS(0), len(repositories)))
+		pullChan := make(chan []PullRequestDetail, max(runtime.GOMAXPROCS(0), len(repositories)))
+		wp := workerpool.New(runtime.GOMAXPROCS(0) * 4)
+
+		for _, repo := range repositories {
+			wp.Submit(func() {
+				issues, pulls, err := client.GetIssuesAndPulls(ctx, repo, limit)
+				if err != nil {
+					fmt.Println("error processing repo:", repo, err)
+					return
+				}
+				if len(issues) > 0 {
+					issueChan <- issues
+				}
+				if len(pulls) > 0 {
+					pullChan <- pulls
+				}
+			})
+		}
+		wp.StopWait()
+		close(issueChan)
+		close(pullChan)
+
+		allIssues = mapset.NewSet[string]()
+		allPulls = mapset.NewSet[string]()
+		allPRDetails = make(map[string]PullRequestDetail)
+
+		for issues := range issueChan {
+			allIssues.Append(issues...)
+		}
+		for pulls := range pullChan {
+			for _, pr := range pulls {
+				allPulls.Add(pr.URL)
+				allPRDetails[pr.URL] = pr
+			}
+		}
 	})
-	wg.Wait()
+
+	initWG.Wait()
 
 	if errI != nil {
 		panic(errI)
@@ -1005,6 +1036,9 @@ func Run(ctx context.Context, client GHClient) {
 	if errP != nil {
 		panic(errP)
 	}
+
+	fmt.Println("issues", allIssues.Cardinality())
+	fmt.Println("pulls", allPulls.Cardinality())
 
 	trackedIssues := mapset.NewSet[string]()
 	for _, item := range bugItems {
@@ -1037,6 +1071,7 @@ func Run(ctx context.Context, client GHClient) {
 
 	var bugProjectID, prProjectID string
 	var errBug, errPR error
+	var wg sync.WaitGroup
 	wg.Go(func() {
 		bugProjectID, errBug = client.GetProjectID(ctx, "kubescape", bugTrackingBoard)
 	})

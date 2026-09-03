@@ -1577,4 +1577,28 @@ func TestApprovedPRWithMergeConflictExcludedFromReadyToMerge(t *testing.T) {
 	}
 }
 
+func TestRunBoardFetchError(t *testing.T) {
+	ctx := t.Context()
+	mockClient := &MockGHClient{
+		GetRepositoriesFunc: func(ctx context.Context, owner string, limit int) ([]string, error) {
+			return []string{"kubescape/repo1"}, nil
+		},
+		GetIssuesAndPullsFunc: func(ctx context.Context, repo string, limit int) ([]string, []PullRequestDetail, error) {
+			return nil, nil, nil
+		},
+		GetProjectItemsWithStateFunc: func(ctx context.Context, owner, board string, limit int) ([]ProjectItem, error) {
+			return nil, errors.New("board query failed")
+		},
+	}
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic on board fetch error, but did not panic")
+		}
+	}()
+
+	Run(ctx, mockClient)
+}
+
 
