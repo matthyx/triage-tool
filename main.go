@@ -1395,7 +1395,10 @@ var createMulticaIssue = defaultCreateMulticaIssue
 
 func defaultCreateMulticaIssue(ctx context.Context, repoName, prNumber, fullURL string) error {
 	title := fmt.Sprintf("%s %s", repoName, prNumber)
-	description := fmt.Sprintf("review %s add PR comments on blockers, when it's good to merge approve", fullURL)
+	description, err := renderPRReviewPrompt(fullURL)
+	if err != nil {
+		return fmt.Errorf("render PR review prompt: %w", err)
+	}
 
 	cmd := exec.CommandContext(ctx, "multica", "issue", "create",
 		"--assignee", "Codex",

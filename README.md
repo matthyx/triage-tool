@@ -77,6 +77,20 @@ visible in the fetched conversation window, the PR is pinned conservatively.
 The `by-conflict` and `by-changes-requested` counters in the routing summary count
 **decisions, not mutations**, so they include PRs already sitting in the right column.
 
+## Multica PR reviews
+
+When an untracked PR from outside `myTeam` is successfully added to the PR board,
+the tool creates a Multica task assigned to `Codex`. Its review instructions live in
+[`prompts/pr-review.tmpl`](prompts/pr-review.tmpl), a Go text template with a `PRURL`
+field. Edit this file to change the review policy, then rebuild with `go build .`.
+The template is embedded in the binary, so deployment needs no separate prompt file.
+Changes apply to newly created tasks; existing Multica tasks retain their descriptions.
+
+The prompt covers related and rejected PRs, necessity, correctness, regression risk,
+validation, maintainability, review history, evidence, approval criteria, a summary,
+and safe execution. These are instructions for the reviewing agent; the triage tool
+does not itself enforce the review policy or provide an execution sandbox.
+
 ## Environment variables
 
 | Variable | Purpose |

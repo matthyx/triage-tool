@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -1246,38 +1247,32 @@ func TestParsePRRepoAndNumber(t *testing.T) {
 }
 
 func TestMulticaIssueInvocation(t *testing.T) {
-	var calledWith []string
-	orig := createMulticaIssue
-	defer func() { createMulticaIssue = orig }()
-
-	createMulticaIssue = func(ctx context.Context, repoName, prNumber, fullURL string) error {
-		title := fmt.Sprintf("%s %s", repoName, prNumber)
-		description := fmt.Sprintf("review %s add PR comments on blockers, when it's good to merge approve", fullURL)
-		calledWith = []string{repoName, prNumber, fullURL, title, description}
-		return nil
+	dir := t.TempDir()
+	capture := filepath.Join(dir, "args")
+	t.Setenv("MULTICA_TEST_ARGS", capture)
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if err := os.WriteFile(filepath.Join(dir, "multica"), []byte("#!/bin/sh\nprintf '%s\\0' \"$@\" > \"$MULTICA_TEST_ARGS\"\n"), 0o700); err != nil {
+		t.Fatal(err)
 	}
-
 	url := "https://github.com/kubescape/node-agent/pull/808"
-	repo, num, ok := parsePRRepoAndNumber(url)
-	if !ok {
-		t.Fatalf("failed to parse url")
+	if err := defaultCreateMulticaIssue(t.Context(), "node-agent", "808", url); err != nil {
+		t.Fatal(err)
 	}
-	err := createMulticaIssue(t.Context(), repo, num, url)
+	data, err := os.ReadFile(capture)
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatal(err)
 	}
-
-	if len(calledWith) != 5 {
-		t.Fatalf("expected 5 elements in calledWith, got %d", len(calledWith))
+	args := strings.Split(strings.TrimSuffix(string(data), "\x00"), "\x00")
+	wantPrefix := []string{"issue", "create", "--assignee", "Codex", "--title", "node-agent 808", "--description"}
+	if len(args) != 8 || !slices.Equal(args[:7], wantPrefix) {
+		t.Fatalf("unexpected command arguments: %q", args)
 	}
-
-	if calledWith[3] != "node-agent 808" {
-		t.Errorf("expected title 'node-agent 808', got %q", calledWith[3])
+	wantDescription, err := renderPRReviewPrompt(url)
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	expectedDesc := "review https://github.com/kubescape/node-agent/pull/808 add PR comments on blockers, when it's good to merge approve"
-	if calledWith[4] != expectedDesc {
-		t.Errorf("expected description %q, got %q", expectedDesc, calledWith[4])
+	if args[7] != wantDescription || !strings.Contains(args[7], url) || strings.Contains(args[7], "{{.PRURL}}") {
+		t.Fatalf("unexpected description: %q", args[7])
 	}
 }
 
@@ -1600,5 +1595,3 @@ func TestRunBoardFetchError(t *testing.T) {
 
 	Run(ctx, mockClient)
 }
-
-
