@@ -20,6 +20,18 @@ func parsePRRepoAndNumber(urlStr string) (repo string, number string, ok bool) {
 	return parts[2], parts[4], true
 }
 
+func parseOwnerAndRepo(urlStr string) (owner string, repo string, ok bool) {
+	parsedURL, err := url.Parse(urlStr)
+	if err != nil {
+		return "", "", false
+	}
+	parts := strings.Split(parsedURL.Path, "/")
+	if len(parts) < 3 {
+		return "", "", false
+	}
+	return parts[1], parts[2], true
+}
+
 var createMulticaIssue = defaultCreateMulticaIssue
 
 func defaultCreateMulticaIssue(ctx context.Context, repoName, prNumber, fullURL string) error {

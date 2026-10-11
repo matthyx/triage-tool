@@ -40,6 +40,9 @@ type GHClient interface {
 	GetToArchiveFieldOption(ctx context.Context, owner, board string) (fieldID, optionID string, err error)
 	GetSingleSelectOptions(ctx context.Context, owner, board string) (map[string]FieldOption, error)
 	UpdateProjectItemField(ctx context.Context, projectID, itemID, fieldID, optionID string) error
+	AddLabelToPR(ctx context.Context, prID, labelID string) error
+	RemoveLabelFromPR(ctx context.Context, prID, labelID string) error
+	EnsureRepoLabel(ctx context.Context, repo, name, color, description string) (string, error)
 }
 
 // FieldOption identifies one option of a single-select project field.
@@ -608,6 +611,7 @@ func (c *RealGHClient) GetIssuesAndPulls(ctx context.Context, repo string, limit
 			} `graphql:"issues(first: $limit, states: OPEN)"`
 			PullRequests struct {
 				Nodes []struct {
+					ID             string
 					URL            string
 					Title          string
 					IsDraft        bool
@@ -615,6 +619,12 @@ func (c *RealGHClient) GetIssuesAndPulls(ctx context.Context, repo string, limit
 					ReviewDecision string
 					Mergeable      string
 					Author         actor
+					Labels         struct {
+						Nodes []struct {
+							ID   string
+							Name string
+						}
+					} `graphql:"labels(first: 100)"`
 					Commits        struct {
 						Nodes []struct {
 							Commit struct {
@@ -694,7 +704,13 @@ func (c *RealGHClient) GetIssuesAndPulls(ctx context.Context, repo string, limit
 			conversation[j] = t.event
 		}
 
+		var labels []Label
+		for _, l := range pr.Labels.Nodes {
+			labels = append(labels, Label{ID: l.ID, Name: l.Name})
+		}
+
 		pulls[i] = PullRequestDetail{
+			ID:             pr.ID,
 			URL:            pr.URL,
 			Title:          pr.Title,
 			Repository:     repo,
@@ -706,6 +722,7 @@ func (c *RealGHClient) GetIssuesAndPulls(ctx context.Context, repo string, limit
 			Conversation:   conversation,
 			Mergeable:      pr.Mergeable,
 			LastCommitAt:   lastCommitAt,
+			Labels:         labels,
 		}
 	}
 	return issues, pulls, nil
@@ -756,4 +773,113 @@ func (c *RealGHClient) GetRepositories(ctx context.Context, owner string, limit 
 		names = append(names, owner+"/"+repo.Name)
 	}
 	return names, nil
+}
+
+func (c *RealGHClient) AddLabelToPR(ctx context.Context, prID, labelID string) error {
+	var mutation struct {
+		AddLabelsToLabelable struct {
+			ClientMutationID string
+		} `graphql:"addLabelsToLabelable(input: $input)"`
+	}
+
+	type AddLabelsToLabelableInput struct {
+		LabelableID githubv4.ID   `json:"labelableId" graphql:"labelableId"`
+		LabelIDs    []githubv4.ID `json:"labelIds" graphql:"labelIds"`
+	}
+
+	input := AddLabelsToLabelableInput{
+		LabelableID: githubv4.ID(prID),
+		LabelIDs:    []githubv4.ID{githubv4.ID(labelID)},
+	}
+
+	return withRetry(func() error { return c.v4Client.Mutate(ctx, &mutation, input, nil) })
+}
+
+func (c *RealGHClient) RemoveLabelFromPR(ctx context.Context, prID, labelID string) error {
+	var mutation struct {
+		RemoveLabelsFromLabelable struct {
+			ClientMutationID string
+		} `graphql:"removeLabelsFromLabelable(input: $input)"`
+	}
+
+	type RemoveLabelsFromLabelableInput struct {
+		LabelableID githubv4.ID   `json:"labelableId" graphql:"labelableId"`
+		LabelIDs    []githubv4.ID `json:"labelIds" graphql:"labelIds"`
+	}
+
+	input := RemoveLabelsFromLabelableInput{
+		LabelableID: githubv4.ID(prID),
+		LabelIDs:    []githubv4.ID{githubv4.ID(labelID)},
+	}
+
+	return withRetry(func() error { return c.v4Client.Mutate(ctx, &mutation, input, nil) })
+}
+
+func (c *RealGHClient) EnsureRepoLabel(ctx context.Context, repo, name, color, description string) (string, error) {
+	owner, repoName, ok := strings.Cut(repo, "/")
+	if !ok {
+		return "", fmt.Errorf("invalid repo format: %s", repo)
+	}
+
+	var query struct {
+		Repository struct {
+			ID    string
+			Label *struct {
+				ID string
+			} `graphql:"label(name: $labelName)"`
+		} `graphql:"repository(owner: $owner, name: $name)"`
+	}
+
+	variables := map[string]any{
+		"owner":     githubv4.String(owner),
+		"name":      githubv4.String(repoName),
+		"labelName": githubv4.String(name),
+	}
+
+	err := withRetry(func() error { return c.v4Client.Query(ctx, &query, variables) })
+	if err != nil {
+		return "", err
+	}
+
+	if query.Repository.Label != nil && query.Repository.Label.ID != "" {
+		return query.Repository.Label.ID, nil
+	}
+
+	var mutation struct {
+		CreateLabel struct {
+			Label struct {
+				ID string
+			}
+		} `graphql:"createLabel(input: $input)"`
+	}
+
+	type CreateLabelInput struct {
+		RepositoryID githubv4.ID      `json:"repositoryId" graphql:"repositoryId"`
+		Name         githubv4.String  `json:"name" graphql:"name"`
+		Color        githubv4.String  `json:"color" graphql:"color"`
+		Description  *githubv4.String `json:"description,omitempty" graphql:"description,omitempty"`
+	}
+
+	var desc *githubv4.String
+	if description != "" {
+		d := githubv4.String(description)
+		desc = &d
+	}
+
+	input := CreateLabelInput{
+		RepositoryID: githubv4.ID(query.Repository.ID),
+		Name:         githubv4.String(name),
+		Color:        githubv4.String(color),
+		Description:  desc,
+	}
+
+	err = withRetry(func() error { return c.v4Client.Mutate(ctx, &mutation, input, nil) })
+	if err != nil {
+		if queryErr := withRetry(func() error { return c.v4Client.Query(ctx, &query, variables) }); queryErr == nil && query.Repository.Label != nil && query.Repository.Label.ID != "" {
+			return query.Repository.Label.ID, nil
+		}
+		return "", err
+	}
+
+	return mutation.CreateLabel.Label.ID, nil
 }

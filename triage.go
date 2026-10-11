@@ -33,6 +33,7 @@ func Run(ctx context.Context, client GHClient) {
 	prItems = append(prItems, newPRItems...)
 	archiveClosedItems(ctx, client, bugProjectID, prProjectID, bugItems, prItems)
 	routeOpenPRs(ctx, client, prProjectID, prItems, allPRDetails)
+	syncNeedsRebaseLabels(ctx, client, allPRDetails)
 	printAttentionReport(allPRDetails)
 }
 
@@ -386,4 +387,128 @@ func routeOpenPRs(ctx context.Context, client GHClient, prProjectID string, prIt
 			candidates, moved, alreadyInTarget, noSuchOption, skippedUnmanaged, byConflict, byChangesRequested)
 	}
 
+}
+
+func syncNeedsRebaseLabels(ctx context.Context, client GHClient, allPRDetails map[string]PullRequestDetail) {
+	dryRun := os.Getenv("TRIAGE_ROUTING_DRY_RUN") != ""
+
+	urls := make([]string, 0, len(allPRDetails))
+	for url := range allPRDetails {
+		urls = append(urls, url)
+	}
+	slices.Sort(urls)
+
+	var mu sync.Mutex
+	repoLabelIDs := make(map[string]string)
+	var added, removed, wouldAdd, wouldRemove int
+
+	getLabelID := func(repo string) (string, error) {
+		mu.Lock()
+		id, ok := repoLabelIDs[repo]
+		mu.Unlock()
+		if ok {
+			return id, nil
+		}
+		id, err := client.EnsureRepoLabel(ctx, repo, labelNeedsRebase, "ededed", "PR has merge conflicts and needs to be rebased")
+		if err != nil {
+			return "", err
+		}
+		mu.Lock()
+		repoLabelIDs[repo] = id
+		mu.Unlock()
+		return id, nil
+	}
+
+	wp := workerpool.New(runtime.GOMAXPROCS(0) * 4)
+	for _, url := range urls {
+		pr := allPRDetails[url]
+		hasLabel := pr.HasLabel(labelNeedsRebase)
+
+		switch {
+		case pr.Mergeable == mergeableConflicting && !hasLabel:
+			if dryRun {
+				wouldAdd++
+				fmt.Printf("would add %q label to %s\n", labelNeedsRebase, pr.URL)
+				continue
+			}
+			wp.Submit(func() {
+				repo := pr.Repository
+				if repo == "" {
+					if owner, r, ok := parseOwnerAndRepo(pr.URL); ok {
+						repo = owner + "/" + r
+					}
+				}
+				labelID, err := getLabelID(repo)
+				if err != nil {
+					fmt.Printf("error ensuring %q label for %s: %v\n", labelNeedsRebase, repo, err)
+					return
+				}
+				prID := pr.ID
+				if prID == "" {
+					var err error
+					prID, err = client.GetContentID(ctx, pr.URL)
+					if err != nil {
+						fmt.Printf("error getting content id for %s: %v\n", pr.URL, err)
+						return
+					}
+				}
+				if err := client.AddLabelToPR(ctx, prID, labelID); err != nil {
+					fmt.Printf("error adding %q label to %s: %v\n", labelNeedsRebase, pr.URL, err)
+					return
+				}
+				mu.Lock()
+				added++
+				mu.Unlock()
+				fmt.Printf("added %q label to %s\n", labelNeedsRebase, pr.URL)
+			})
+
+		case pr.Mergeable == mergeableMergeable && hasLabel:
+			if dryRun {
+				wouldRemove++
+				fmt.Printf("would remove %q label from %s\n", labelNeedsRebase, pr.URL)
+				continue
+			}
+			wp.Submit(func() {
+				labelID := pr.LabelID(labelNeedsRebase)
+				if labelID == "" {
+					repo := pr.Repository
+					if repo == "" {
+						if owner, r, ok := parseOwnerAndRepo(pr.URL); ok {
+							repo = owner + "/" + r
+						}
+					}
+					var err error
+					labelID, err = getLabelID(repo)
+					if err != nil {
+						fmt.Printf("error ensuring %q label for %s: %v\n", labelNeedsRebase, repo, err)
+						return
+					}
+				}
+				prID := pr.ID
+				if prID == "" {
+					var err error
+					prID, err = client.GetContentID(ctx, pr.URL)
+					if err != nil {
+						fmt.Printf("error getting content id for %s: %v\n", pr.URL, err)
+						return
+					}
+				}
+				if err := client.RemoveLabelFromPR(ctx, prID, labelID); err != nil {
+					fmt.Printf("error removing %q label from %s: %v\n", labelNeedsRebase, pr.URL, err)
+					return
+				}
+				mu.Lock()
+				removed++
+				mu.Unlock()
+				fmt.Printf("removed %q label from %s\n", labelNeedsRebase, pr.URL)
+			})
+		}
+	}
+	wp.StopWait()
+
+	if dryRun {
+		fmt.Printf("labels: %d would-add, %d would-remove\n", wouldAdd, wouldRemove)
+	} else {
+		fmt.Printf("labels: %d added, %d removed\n", added, removed)
+	}
 }

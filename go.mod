@@ -13,5 +13,4 @@ require (
 require (
 	github.com/gammazero/deque v1.2.0 // indirect
 	github.com/shurcooL/graphql v0.0.0-20240915155400-7ee5256398cf // indirect
-	golang.org/x/tools v0.49.0 // indirect
 )

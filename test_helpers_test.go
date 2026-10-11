@@ -31,6 +31,9 @@ type MockGHClient struct {
 	GetToArchiveFieldOptionFunc  func(ctx context.Context, owner, board string) (string, string, error)
 	GetSingleSelectOptionsFunc   func(ctx context.Context, owner, board string) (map[string]FieldOption, error)
 	UpdateProjectItemFieldFunc   func(ctx context.Context, projectID, itemID, fieldID, optionID string) error
+	AddLabelToPRFunc             func(ctx context.Context, prID, labelID string) error
+	RemoveLabelFromPRFunc        func(ctx context.Context, prID, labelID string) error
+	EnsureRepoLabelFunc          func(ctx context.Context, repo, name, color, description string) (string, error)
 }
 
 func (m *MockGHClient) AddProjectItem(ctx context.Context, owner, board, url string) error {
@@ -75,6 +78,27 @@ func (m *MockGHClient) GetSingleSelectOptions(ctx context.Context, owner, board 
 
 func (m *MockGHClient) UpdateProjectItemField(ctx context.Context, projectID, itemID, fieldID, optionID string) error {
 	return m.UpdateProjectItemFieldFunc(ctx, projectID, itemID, fieldID, optionID)
+}
+
+func (m *MockGHClient) AddLabelToPR(ctx context.Context, prID, labelID string) error {
+	if m.AddLabelToPRFunc != nil {
+		return m.AddLabelToPRFunc(ctx, prID, labelID)
+	}
+	return nil
+}
+
+func (m *MockGHClient) RemoveLabelFromPR(ctx context.Context, prID, labelID string) error {
+	if m.RemoveLabelFromPRFunc != nil {
+		return m.RemoveLabelFromPRFunc(ctx, prID, labelID)
+	}
+	return nil
+}
+
+func (m *MockGHClient) EnsureRepoLabel(ctx context.Context, repo, name, color, description string) (string, error) {
+	if m.EnsureRepoLabelFunc != nil {
+		return m.EnsureRepoLabelFunc(ctx, repo, name, color, description)
+	}
+	return "label-id-" + name, nil
 }
 
 // statusOptions is the well-formed board shape: all four routing options on one

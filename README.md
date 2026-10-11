@@ -4,7 +4,8 @@ Keeps the `kubescape` GitHub Projects boards in sync with reality: it adds untra
 open issues and pull requests to the bug and PR boards, moves closed or merged items
 to **To Archive**, moves team PRs (`myTeam`) to **WIP**, routes open PRs between **Waiting on Author**
 and **Needs Reviewer** based on who spoke last in the conversation — plus whether the PR has a
-**merge conflict** or an **outstanding change request** — and prints a priority report of the PRs
+**merge conflict** or an **outstanding change request** — manages the **`needs-rebase`** label
+on conflicting and resolved PRs across tracked repositories, and prints a priority report of the PRs
 needing attention.
 
 Routing only ever touches items whose current status is unset, *Waiting on Author*,
@@ -38,12 +39,18 @@ in *Waiting on Author*; they never move a PR the last-commenter rule would have 
 alone, and they never produce a *Needs Reviewer* the last-commenter rule did not already
 produce.
 
-### Merge conflicts
+### Merge conflicts and "needs-rebase" label
 
 GitHub computes mergeability asynchronously, so `mergeable` is often `UNKNOWN` on a cold
 query — around 30% of PRs in practice, collapsing to near zero on an immediate re-query.
 `UNKNOWN` is treated as *no signal*, never as "not conflicting". A conflicted PR may
 therefore keep its old column for a run or two; the next run picks it up.
+
+In addition to routing on the project board, the tool automatically reconciles the
+`needs-rebase` label across all open PRs in tracked repositories:
+- When a PR is reported as `CONFLICTING` and does not have the `needs-rebase` label, the label is added (and automatically created in the repository if not already present).
+- When the conflict is resolved and GitHub reports the PR as `MERGEABLE`, the `needs-rebase` label is removed.
+- `UNKNOWN` mergeability leaves the label untouched until GitHub computes the mergeable state.
 
 ### When a change request counts as "addressed"
 
@@ -59,7 +66,7 @@ are wrong in **both** directions:
   change request, and the PR reads as "addressed".
 
 The second case is the reason this is safe to ship on approximations: **when the heuristic
-guesses "addressed" wrongly, the tool simply behaves as it did before this feature
+guesses "addressed" wrongly, the tool behaves as it did before this feature
 existed** — control falls through to the last-commenter answer, so no PR ends up anywhere
 the old rule would not have put it.
 
@@ -73,6 +80,10 @@ visible in the fetched conversation window, the PR is pinned conservatively.
 | --- | --- |
 | `moved pr <url> from "<a>" to "<b>" (<reason>)` | The board was changed. |
 | `would move pr <url> from "<a>" to "<b>" (<reason>)` | Same, under `TRIAGE_ROUTING_DRY_RUN`. |
+| `added "needs-rebase" label to <url>` | The `needs-rebase` label was added. |
+| `would add "needs-rebase" label to <url>` | Same, under `TRIAGE_ROUTING_DRY_RUN`. |
+| `removed "needs-rebase" label from <url>` | The `needs-rebase` label was removed. |
+| `would remove "needs-rebase" label from <url>` | Same, under `TRIAGE_ROUTING_DRY_RUN`. |
 
 The `by-conflict` and `by-changes-requested` counters in the routing summary count
 **decisions, not mutations**, so they include PRs already sitting in the right column.
@@ -96,9 +107,9 @@ does not itself enforce the review policy or provide an execution sandbox.
 | Variable | Purpose |
 | --- | --- |
 | `GITHUB_TOKEN` | **Required.** Token for the GraphQL API. Also read from a `.env` file. |
-| `TRIAGE_ROUTING_DRY_RUN` | When set to any non-empty value, the routing step only prints the moves it *would* make. |
+| `TRIAGE_ROUTING_DRY_RUN` | When set to any non-empty value, board routing and label management run in dry-run mode and log intended mutations without writing to GitHub. |
 
-`TRIAGE_ROUTING_DRY_RUN` gates **the routing step only**. Adding items to boards and
+`TRIAGE_ROUTING_DRY_RUN` gates **board routing and label mutations**. Adding items to boards and
 archiving closed items still write to the live boards while it is set.
 
 ## Rollback

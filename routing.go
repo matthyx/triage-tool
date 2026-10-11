@@ -28,7 +28,15 @@ const (
 	reasonChangesRequested = "changes-requested"
 	reasonLastCommenter    = "last-commenter"
 	reasonOwnPR            = "own-pr"
+
+	labelNeedsRebase = "needs-rebase"
 )
+
+// Label represents a GitHub label attached to an item or repository.
+type Label struct {
+	ID   string
+	Name string
+}
 
 // routableStatuses are the only current statuses the routing rule may overwrite.
 // "To Archive" is deliberately absent: a human can park an open PR there to mean
@@ -44,6 +52,7 @@ type CommentEvent struct {
 }
 
 type PullRequestDetail struct {
+	ID             string
 	URL            string
 	Title          string
 	Repository     string
@@ -55,6 +64,25 @@ type PullRequestDetail struct {
 	Conversation   []CommentEvent // oldest first
 	Mergeable      string         // MergeableState: "MERGEABLE" | "CONFLICTING" | "UNKNOWN" | ""
 	LastCommitAt   time.Time      // committedDate of the PR tip commit; zero when absent
+	Labels         []Label
+}
+
+func (pr PullRequestDetail) HasLabel(name string) bool {
+	for _, l := range pr.Labels {
+		if l.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func (pr PullRequestDetail) LabelID(name string) string {
+	for _, l := range pr.Labels {
+		if l.Name == name {
+			return l.ID
+		}
+	}
+	return ""
 }
 
 // managedStatuses are the status names this tool knows how to set.
