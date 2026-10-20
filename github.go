@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"slices"
@@ -199,8 +200,12 @@ func isTransientError(err error) bool {
 		return false
 	}
 	s := err.Error()
-	return strings.Contains(s, "temporary conflict") || strings.Contains(s, "Something went wrong")
+	return strings.Contains(s, "temporary conflict") ||
+		strings.Contains(s, "Something went wrong") ||
+		strings.Contains(s, "secondary rate limit")
 }
+
+var retrySleep = time.Sleep
 
 func withRetry(fn func() error) error {
 	const maxRetries = 5
@@ -211,7 +216,8 @@ func withRetry(fn func() error) error {
 			return nil
 		}
 		if i < maxRetries-1 && isTransientError(err) {
-			time.Sleep(backoff)
+			jitter := rand.N(backoff / 2)
+			retrySleep(backoff/2 + jitter)
 			backoff *= 2
 			continue
 		}

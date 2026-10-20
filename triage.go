@@ -6,6 +6,7 @@ import (
 	"os"
 	"runtime"
 	"slices"
+	"strconv"
 	"sync"
 	"time"
 
@@ -16,9 +17,19 @@ import (
 const (
 	bugTrackingBoard = "4"
 	prTrackingBoard  = "5"
+	maxConcurrency   = 8
 )
 
 var myTeam = []string{"matthyx", "entlein"}
+
+func workerPoolSize() int {
+	if s := os.Getenv("TRIAGE_CONCURRENCY"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n > 0 {
+			return n
+		}
+	}
+	return min(maxConcurrency, max(1, runtime.GOMAXPROCS(0)*2))
+}
 
 func Run(ctx context.Context, client GHClient) {
 	start := time.Now()
@@ -61,7 +72,7 @@ func fetchTriageData(ctx context.Context, client GHClient, limit int) (allIssues
 
 		issueChan := make(chan []string, max(runtime.GOMAXPROCS(0), len(repositories)))
 		pullChan := make(chan []PullRequestDetail, max(runtime.GOMAXPROCS(0), len(repositories)))
-		wp := workerpool.New(runtime.GOMAXPROCS(0) * 4)
+		wp := workerpool.New(workerPoolSize())
 
 		for _, repo := range repositories {
 			wp.Submit(func() {
@@ -171,7 +182,7 @@ func addUntrackedItems(ctx context.Context, client GHClient, bugProjectID, prPro
 	var newPRItems []ProjectItem
 
 	wg.Go(func() {
-		wp := workerpool.New(runtime.GOMAXPROCS(0) * 4)
+		wp := workerpool.New(workerPoolSize())
 		for _, url := range issueURLs {
 			wp.Submit(func() {
 				contentID, err := client.GetContentID(ctx, url)
@@ -190,7 +201,7 @@ func addUntrackedItems(ctx context.Context, client GHClient, bugProjectID, prPro
 		wp.StopWait()
 	})
 	wg.Go(func() {
-		wp := workerpool.New(runtime.GOMAXPROCS(0) * 4)
+		wp := workerpool.New(workerPoolSize())
 		for _, url := range prURLs {
 			wp.Submit(func() {
 				contentID, err := client.GetContentID(ctx, url)
@@ -254,7 +265,7 @@ func archiveClosedItems(ctx context.Context, client GHClient, bugProjectID, prPr
 	}
 
 	wg.Go(func() {
-		wp := workerpool.New(runtime.GOMAXPROCS(0) * 4)
+		wp := workerpool.New(workerPoolSize())
 		for _, item := range bugItems {
 			if !item.Closed || item.InArchive {
 				continue
@@ -271,7 +282,7 @@ func archiveClosedItems(ctx context.Context, client GHClient, bugProjectID, prPr
 		wp.StopWait()
 	})
 	wg.Go(func() {
-		wp := workerpool.New(runtime.GOMAXPROCS(0) * 4)
+		wp := workerpool.New(workerPoolSize())
 		for _, item := range prItems {
 			if !item.Closed || item.InArchive {
 				continue
@@ -318,7 +329,7 @@ func routeOpenPRs(ctx context.Context, client GHClient, prProjectID string, prIt
 		var byConflict, byChangesRequested int
 		loggedMissingOption := map[string]bool{}
 
-		routeWP := workerpool.New(runtime.GOMAXPROCS(0) * 4)
+		routeWP := workerpool.New(workerPoolSize())
 		for _, item := range prItems {
 			// prItems is stale in memory after the archive mutations, so closed
 			// items are excluded explicitly rather than by block ordering.
@@ -419,7 +430,7 @@ func syncNeedsRebaseLabels(ctx context.Context, client GHClient, allPRDetails ma
 		return id, nil
 	}
 
-	wp := workerpool.New(runtime.GOMAXPROCS(0) * 4)
+	wp := workerpool.New(workerPoolSize())
 	for _, url := range urls {
 		pr := allPRDetails[url]
 		hasLabel := pr.HasLabel(labelNeedsRebase)

@@ -1,8 +1,10 @@
 package main
 
 import (
+	"errors"
 	"slices"
 	"testing"
+	"time"
 )
 
 func TestClassifyReviewStatus(t *testing.T) {
@@ -168,4 +170,127 @@ func TestResolveStatusName(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestIsTransientError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil error", err: nil, want: false},
+		{name: "Something went wrong", err: errors.New("Something went wrong while executing your query on 2026-10-20T10:12:44Z"), want: true},
+		{name: "temporary conflict", err: errors.New("temporary conflict occurred"), want: true},
+		{name: "secondary rate limit", err: errors.New("You have exceeded a secondary rate limit"), want: true},
+		{name: "permanent error", err: errors.New("Could not resolve to a Repository with the name 'foo'"), want: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isTransientError(tc.err); got != tc.want {
+				t.Errorf("isTransientError(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestWithRetry(t *testing.T) {
+	origRetrySleep := retrySleep
+	defer func() { retrySleep = origRetrySleep }()
+
+	t.Run("succeeds first attempt without sleep", func(t *testing.T) {
+		sleepCalls := 0
+		retrySleep = func(d time.Duration) { sleepCalls++ }
+
+		attempts := 0
+		err := withRetry(func() error {
+			attempts++
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if attempts != 1 {
+			t.Errorf("attempts = %d, want 1", attempts)
+		}
+		if sleepCalls != 0 {
+			t.Errorf("sleepCalls = %d, want 0", sleepCalls)
+		}
+	})
+
+	t.Run("retries transient error with jittered backoff", func(t *testing.T) {
+		var sleptDurations []time.Duration
+		retrySleep = func(d time.Duration) {
+			sleptDurations = append(sleptDurations, d)
+		}
+
+		attempts := 0
+		transientErr := errors.New("Something went wrong")
+		err := withRetry(func() error {
+			attempts++
+			if attempts < 3 {
+				return transientErr
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if attempts != 3 {
+			t.Errorf("attempts = %d, want 3", attempts)
+		}
+		if len(sleptDurations) != 2 {
+			t.Fatalf("len(sleptDurations) = %d, want 2", len(sleptDurations))
+		}
+		// First backoff is 500ms, sleep should be in [250ms, 500ms]
+		if sleptDurations[0] < 250*time.Millisecond || sleptDurations[0] > 500*time.Millisecond {
+			t.Errorf("sleptDurations[0] = %v, want [250ms, 500ms]", sleptDurations[0])
+		}
+		// Second backoff is 1000ms, sleep should be in [500ms, 1000ms]
+		if sleptDurations[1] < 500*time.Millisecond || sleptDurations[1] > 1000*time.Millisecond {
+			t.Errorf("sleptDurations[1] = %v, want [500ms, 1000ms]", sleptDurations[1])
+		}
+	})
+
+	t.Run("does not retry permanent error", func(t *testing.T) {
+		sleepCalls := 0
+		retrySleep = func(d time.Duration) { sleepCalls++ }
+
+		attempts := 0
+		permanentErr := errors.New("fatal query error")
+		err := withRetry(func() error {
+			attempts++
+			return permanentErr
+		})
+		if !errors.Is(err, permanentErr) {
+			t.Fatalf("err = %v, want permanentErr", err)
+		}
+		if attempts != 1 {
+			t.Errorf("attempts = %d, want 1", attempts)
+		}
+		if sleepCalls != 0 {
+			t.Errorf("sleepCalls = %d, want 0", sleepCalls)
+		}
+	})
+
+	t.Run("exhausts retries on persistent transient error", func(t *testing.T) {
+		sleepCalls := 0
+		retrySleep = func(d time.Duration) { sleepCalls++ }
+
+		attempts := 0
+		transientErr := errors.New("Something went wrong")
+		err := withRetry(func() error {
+			attempts++
+			return transientErr
+		})
+		if !errors.Is(err, transientErr) {
+			t.Fatalf("err = %v, want transientErr", err)
+		}
+		if attempts != 5 {
+			t.Errorf("attempts = %d, want 5", attempts)
+		}
+		if sleepCalls != 4 {
+			t.Errorf("sleepCalls = %d, want 4", sleepCalls)
+		}
+	})
 }

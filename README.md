@@ -108,6 +108,7 @@ does not itself enforce the review policy or provide an execution sandbox.
 | --- | --- |
 | `GITHUB_TOKEN` | **Required.** Token for the GraphQL API. Also read from a `.env` file. |
 | `TRIAGE_ROUTING_DRY_RUN` | When set to any non-empty value, board routing and label management run in dry-run mode and log intended mutations without writing to GitHub. |
+| `TRIAGE_CONCURRENCY` | Maximum concurrent workers for API operations (defaults to `min(8, max(1, GOMAXPROCS*2))`). |
 
 `TRIAGE_ROUTING_DRY_RUN` gates **board routing and label mutations**. Adding items to boards and
 archiving closed items still write to the live boards while it is set.

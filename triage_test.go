@@ -511,3 +511,34 @@ func TestRunBoardFetchError(t *testing.T) {
 
 	Run(ctx, mockClient)
 }
+
+func TestWorkerPoolSize(t *testing.T) {
+	t.Run("default is within expected bounds", func(t *testing.T) {
+		t.Setenv("TRIAGE_CONCURRENCY", "")
+		size := workerPoolSize()
+		if size < 1 || size > maxConcurrency {
+			t.Errorf("workerPoolSize() = %d, want between 1 and %d", size, maxConcurrency)
+		}
+	})
+
+	t.Run("overridden by TRIAGE_CONCURRENCY", func(t *testing.T) {
+		t.Setenv("TRIAGE_CONCURRENCY", "4")
+		if got := workerPoolSize(); got != 4 {
+			t.Errorf("workerPoolSize() = %d, want 4", got)
+		}
+	})
+
+	t.Run("invalid TRIAGE_CONCURRENCY falls back to default", func(t *testing.T) {
+		t.Setenv("TRIAGE_CONCURRENCY", "invalid")
+		size := workerPoolSize()
+		if size < 1 || size > maxConcurrency {
+			t.Errorf("workerPoolSize() = %d, want between 1 and %d", size, maxConcurrency)
+		}
+
+		t.Setenv("TRIAGE_CONCURRENCY", "-1")
+		size = workerPoolSize()
+		if size < 1 || size > maxConcurrency {
+			t.Errorf("workerPoolSize() = %d, want between 1 and %d", size, maxConcurrency)
+		}
+	})
+}
