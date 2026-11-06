@@ -27,7 +27,7 @@ func printAttentionReport(allPRDetails map[string]PullRequestDetail) {
 			continue
 		}
 		// Priority 3: Stale / Waiting on Reviews
-		if pr.IsDraft {
+		if pr.IsDraft || pr.Author == "matthyx" {
 			continue
 		}
 		isStale := now.Sub(pr.UpdatedAt) > staleThresholdDays*24*time.Hour

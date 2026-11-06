@@ -209,3 +209,37 @@ func TestApprovedPRWithMergeConflictExcludedFromReadyToMerge(t *testing.T) {
 		t.Errorf("expected unknown mergeability approved PR (pull/3) to be excluded from APPROVED & READY TO MERGE section, output:\n%s", attnOut)
 	}
 }
+
+func TestStaleOrWaitingSkipsMatthyxPRs(t *testing.T) {
+	now := time.Now()
+	allPRDetails := map[string]PullRequestDetail{
+		"https://github.com/kubescape/repo1/pull/1": {
+			URL:            "https://github.com/kubescape/repo1/pull/1",
+			Title:          "My stale PR",
+			Repository:     "kubescape/repo1",
+			Author:         "matthyx",
+			CIState:        "SUCCESS",
+			ReviewDecision: "REVIEW_REQUIRED",
+			UpdatedAt:      now.Add(-10 * 24 * time.Hour),
+		},
+		"https://github.com/kubescape/repo1/pull/2": {
+			URL:            "https://github.com/kubescape/repo1/pull/2",
+			Title:          "Someone else's stale PR",
+			Repository:     "kubescape/repo1",
+			Author:         "otheruser",
+			CIState:        "SUCCESS",
+			ReviewDecision: "REVIEW_REQUIRED",
+			UpdatedAt:      now.Add(-10 * 24 * time.Hour),
+		},
+	}
+
+	out := captureOutput(t, func() { printAttentionReport(allPRDetails) })
+
+	if strings.Contains(out, "https://github.com/kubescape/repo1/pull/1") {
+		t.Errorf("expected PR authored by matthyx (pull/1) to be skipped in STALE OR WAITING ON REVIEWS, output:\n%s", out)
+	}
+	if !strings.Contains(out, "https://github.com/kubescape/repo1/pull/2") {
+		t.Errorf("expected PR authored by otheruser (pull/2) to appear in STALE OR WAITING ON REVIEWS, output:\n%s", out)
+	}
+}
+
