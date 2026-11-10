@@ -67,7 +67,7 @@ func TestMulticaIssueInvocation(t *testing.T) {
 		t.Fatal(err)
 	}
 	args := strings.Split(strings.TrimSuffix(string(data), "\x00"), "\x00")
-	wantPrefix := []string{"issue", "create", "--assignee", "Codex", "--title", "node-agent 808", "--description"}
+	wantPrefix := []string{"issue", "create", "--assignee", "Claude", "--title", "node-agent 808", "--description"}
 	if len(args) != 8 || !slices.Equal(args[:7], wantPrefix) {
 		t.Fatalf("unexpected command arguments: %q", args)
 	}

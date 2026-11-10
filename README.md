@@ -91,7 +91,7 @@ The `by-conflict` and `by-changes-requested` counters in the routing summary cou
 ## Multica PR reviews
 
 When an untracked PR from outside `myTeam` is successfully added to the PR board,
-the tool creates a Multica task assigned to `Codex`. Its review instructions live in
+the tool creates a Multica task assigned to `Claude`. Its review instructions live in
 [`prompts/pr-review.tmpl`](prompts/pr-review.tmpl), a Go text template with a `PRURL`
 field. Edit this file to change the review policy, then rebuild with `go build .`.
 The template is embedded in the binary, so deployment needs no separate prompt file.
