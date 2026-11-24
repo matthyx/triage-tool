@@ -42,7 +42,7 @@ func defaultCreateMulticaIssue(ctx context.Context, repoName, prNumber, fullURL 
 	}
 
 	cmd := exec.CommandContext(ctx, "multica", "issue", "create",
-		"--assignee", "Claude",
+		"--assignee", "Copilot",
 		"--title", title,
 		"--description", description,
 	)
